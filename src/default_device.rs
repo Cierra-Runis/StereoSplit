@@ -94,7 +94,7 @@ const CLSID_POLICY_CONFIG_CLIENT: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af
 static RESTORED_TO: Mutex<Option<String>> = Mutex::new(None);
 
 fn restore_file() -> std::path::PathBuf {
-    config::exe_dir().join("restore-device.txt")
+    config::data_dir().join(config::RESTORE_FILE)
 }
 
 fn com_init() {
@@ -195,7 +195,10 @@ pub fn take_over(cfg: &Config) -> Result<()> {
     com_init();
     unsafe {
         let cable = cable_id(cfg).ok_or_else(|| {
-            anyhow!("Can't switch the default device: \"{}\" not found", cfg.source)
+            anyhow!(
+                "Can't switch the default device: \"{}\" not found",
+                cfg.source
+            )
         })?;
         let current = current_default();
         if current.as_deref() == Some(cable.as_str()) {

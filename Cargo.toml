@@ -31,6 +31,10 @@ windows = { version = "0.58", features = [
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_WindowsAndMessaging",
 ] }
+toml_edit = "0.25"
+smart-default = "0.7"
+notify = "8"
+toml-example = "0.17"
 
 [profile.release]
 opt-level = 3
@@ -39,3 +43,6 @@ strip = true
 # A panic anywhere ends the whole program (which then restarts automatically)
 # instead of leaving it running with a dead audio thread
 panic = "abort"
+
+[dev-dependencies]
+tempfile = "3.27.0"

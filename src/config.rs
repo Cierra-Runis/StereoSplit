@@ -1,94 +1,128 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::path::PathBuf;
-use std::time::SystemTime;
+use smart_default::SmartDefault;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use toml_edit::DocumentMut;
+use toml_example::TomlExample;
 
-/// Config file contents. Device names are matched by case-insensitive substring,
-/// so part of the name is enough.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// Name of the data folder, both next to the exe (portable) and under %LOCALAPPDATA%
+const APP_DIR: &str = "StereoSplit";
+pub const CONFIG_FILE: &str = "config.toml";
+pub const LOG_FILE: &str = "stereo-split.log";
+pub const RESTORE_FILE: &str = "restore-device.txt";
+
+// The doc comments below are also the comments in a new config file (via `TomlExample`),
+// so they are written for whoever edits that file by hand. Defaults come only from
+// `#[default]`; `#[toml_example(default)]` would only change the example file.
+
+/// Stereo Split config file
+/// Everything here can also be changed from the tray menu. Changes made in this file take
+/// effect as soon as it is saved.
+/// Device names are matched by case-insensitive substring, so part of the name is enough.
+///
+#[derive(Debug, Clone, PartialEq, Deserialize, SmartDefault, TomlExample)]
 #[serde(default)]
 pub struct Config {
-    /// Speaker for the left channel (empty until chosen in the tray menu)
+    /// Speaker for the left channel
     pub left: String,
 
-    /// Speaker for the right channel (empty until chosen in the tray menu)
+    /// Speaker for the right channel
     pub right: String,
 
-    /// Buffer latency in milliseconds. Raise it if you hear crackling, lower it for less delay.
+    /// Buffer latency in milliseconds. Raise to 50 if you hear crackling or dropouts;
+    /// try 15 for less delay.
+    #[default(20)]
     pub latency_ms: u32,
 
-    /// Where to capture sound from. A playback device (e.g. "CABLE Input") is captured via
-    /// loopback, which does not trigger the microphone indicator; a recording device
-    /// (e.g. the older default "CABLE Output") is also accepted.
+    /// Where to capture sound from: VB-CABLE's playback side (reads what it is playing directly,
+    /// without opening any recording device). A recording device such as "CABLE Output"
+    /// also works.
+    #[default("CABLE Input")]
     pub source: String,
 
-    /// Which playback device's Windows volume to follow (VB-CABLE's playback side is "CABLE Input")
+    /// Which device's Windows volume to follow: VB-CABLE's playback side
+    #[default("CABLE Input")]
     pub volume_endpoint: String,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            left: String::new(),
-            right: String::new(),
-            latency_ms: 20,
-            source: "CABLE Input".into(),
-            volume_endpoint: "CABLE Input".into(),
+/// `text` with the values from `cfg` put in. Everything else in it (comments, order, layout)
+/// is kept as is.
+fn update(text: &str, cfg: &Config) -> Result<String> {
+    let mut doc: DocumentMut = text.parse()?;
+    let values: [(&str, toml_edit::Value); 5] = [
+        ("left", cfg.left.as_str().into()),
+        ("right", cfg.right.as_str().into()),
+        ("latency_ms", i64::from(cfg.latency_ms).into()),
+        ("source", cfg.source.as_str().into()),
+        ("volume_endpoint", cfg.volume_endpoint.as_str().into()),
+    ];
+    for (key, mut value) in values {
+        // Comments above a key belong to the key and stay on their own; a comment after the
+        // value belongs to the value, so carry it over
+        if let Some(old) = doc.get(key).and_then(|item| item.as_value()) {
+            *value.decor_mut() = old.decor().clone();
         }
+        doc[key] = toml_edit::Item::Value(value);
     }
+    Ok(doc.to_string())
 }
 
-/// Config file text, with a comment above every setting for anyone editing it by hand
-fn render(cfg: &Config) -> String {
-    // Let toml do the quoting and escaping
-    let q = |s: &str| toml::Value::String(s.into()).to_string();
-    format!(
-        r#"# Stereo Split config file
-# Everything here can also be changed from the tray menu. Changes made in this file take
-# effect as soon as it is saved.
-# Device names are matched by case-insensitive substring, so part of the name is enough.
-
-# Speaker for the left channel
-left = {left}
-
-# Speaker for the right channel
-right = {right}
-
-# Buffer latency in milliseconds. Raise to 50 if you hear crackling or dropouts;
-# try 15 for less delay.
-latency_ms = {latency}
-
-# Where to capture sound from: VB-CABLE's playback side (reads what it is playing directly,
-# without opening any recording device)
-source = {source}
-
-# Which device's Windows volume to follow: VB-CABLE's playback side
-volume_endpoint = {volume}
-"#,
-        left = q(&cfg.left),
-        right = q(&cfg.right),
-        latency = cfg.latency_ms,
-        source = q(&cfg.source),
-        volume = q(&cfg.volume_endpoint),
-    )
-}
-
-pub fn exe_dir() -> PathBuf {
+fn exe_dir() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-pub fn config_path() -> PathBuf {
-    exe_dir().join("config.toml")
+/// Release builds are portable when the data folder next to the exe has a config in it;
+/// otherwise they keep their data under %LOCALAPPDATA%.
+fn choose_dir(exe_dir: &Path, local_appdata: Option<PathBuf>) -> PathBuf {
+    let portable = exe_dir.join(APP_DIR);
+    if portable.join(CONFIG_FILE).exists() {
+        return portable;
+    }
+    local_appdata.map_or(portable, |d| d.join(APP_DIR))
 }
 
-/// Last modification time of the config file, used to pick up changes automatically
-pub fn modified() -> Option<SystemTime> {
-    std::fs::metadata(config_path())
-        .and_then(|m| m.modified())
-        .ok()
+/// Older versions kept their files loose next to the exe; move them into the data folder
+/// there, which keeps such an install portable. Must not log (logging needs `data_dir`).
+fn migrate_legacy(exe_dir: &Path) {
+    let dir = exe_dir.join(APP_DIR);
+    if !exe_dir.join(CONFIG_FILE).exists() || dir.join(CONFIG_FILE).exists() {
+        return;
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for name in [CONFIG_FILE, LOG_FILE, RESTORE_FILE] {
+        let old = exe_dir.join(name);
+        if old.exists() {
+            let _ = std::fs::rename(&old, dir.join(name));
+        }
+    }
+}
+
+/// Folder holding the config file, the log and the saved default device. Debug builds always
+/// use the one next to the exe (in target/), so they never touch an installed copy's data.
+pub fn data_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let exe = exe_dir();
+        migrate_legacy(&exe);
+        let dir = if cfg!(debug_assertions) {
+            exe.join(APP_DIR)
+        } else {
+            choose_dir(&exe, std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        };
+        // Errors show up later, when a file in it is written
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
+pub fn config_path() -> PathBuf {
+    data_dir().join(CONFIG_FILE)
 }
 
 /// Load the config; if the file does not exist, write one with the defaults.
@@ -104,32 +138,123 @@ pub fn load() -> Result<Config> {
     toml::from_str(&text).context("Config file is malformed")
 }
 
+/// Save the config, changing only the values in the existing file so anything added to it by
+/// hand stays. A missing or unreadable file is written fresh, with the doc comments on
+/// `Config` as its comments.
 pub fn save(cfg: &Config) -> Result<()> {
     let path = config_path();
-    std::fs::write(&path, render(cfg))
+    let text = match std::fs::read_to_string(&path)
+        .map_err(anyhow::Error::from)
+        .and_then(|old| update(&old, cfg))
+    {
+        Ok(text) => text,
+        Err(_) => update(&Config::toml_example(), cfg)?,
+    };
+    std::fs::write(&path, text)
         .with_context(|| format!("Failed to write config file {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
-    #[test]
-    fn render_round_trips() {
-        let cfg = Config {
-            left: r#"Speakers "L" (USB\Audio)"#.into(),
-            right: "Speaker-Right".into(),
-            latency_ms: 35,
-            source: "CABLE Input".into(),
-            volume_endpoint: "CABLE In".into(),
-        };
-        let parsed: Config = toml::from_str(&render(&cfg)).unwrap();
-        assert_eq!(parsed, cfg);
+    fn read(path: impl AsRef<Path>) -> String {
+        fs::read_to_string(path).unwrap()
     }
 
     #[test]
-    fn missing_fields_use_defaults() {
-        let parsed: Config = toml::from_str("").unwrap();
-        assert_eq!(parsed, Config::default());
+    fn new_file_has_every_key_commented() {
+        let cfg = Config {
+            left: "Desk L".into(),
+            latency_ms: 35,
+            ..Config::default()
+        };
+        let out = update(&Config::toml_example(), &cfg).unwrap();
+        let doc: DocumentMut = out.parse().unwrap();
+        // A key missing from the example would be appended without a comment
+        for (key, _) in doc.iter() {
+            let key = doc.as_table().key(key).unwrap();
+            let prefix = key.leaf_decor().prefix().and_then(|p| p.as_str());
+            assert!(
+                prefix.is_some_and(|p| p.contains('#')),
+                "{key} has no comment"
+            );
+        }
+        assert_eq!(toml::from_str::<Config>(&out).unwrap(), cfg);
+    }
+
+    #[test]
+    fn update_keeps_user_edits() {
+        let text = "# mine\nlatency_ms = 20 # was crackling at 15\n\n# note\nleft = \"x\"\n";
+        let cfg = Config {
+            latency_ms: 50,
+            ..Config::default()
+        };
+        let out = update(text, &cfg).unwrap();
+        assert!(
+            out.starts_with(
+                "# mine\nlatency_ms = 50 # was crackling at 15\n\n# note\nleft = \"\"\n"
+            ),
+            "{out}"
+        );
+        assert_eq!(toml::from_str::<Config>(&out).unwrap(), cfg);
+    }
+
+    #[test]
+    fn missing_keys_use_defaults() {
+        let parsed: Config = toml::from_str("latency_ms = 30").unwrap();
+        let expected = Config {
+            latency_ms: 30,
+            ..Config::default()
+        };
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn choose_dir_is_portable_only_with_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exe, appdata) = (tmp.path().join("exe"), tmp.path().join("appdata"));
+        let portable = exe.join(APP_DIR);
+
+        assert_eq!(
+            choose_dir(&exe, Some(appdata.clone())),
+            appdata.join(APP_DIR)
+        );
+        assert_eq!(choose_dir(&exe, None), portable);
+
+        fs::create_dir_all(&portable).unwrap();
+        fs::write(portable.join(CONFIG_FILE), "").unwrap();
+        assert_eq!(choose_dir(&exe, Some(appdata)), portable);
+    }
+
+    #[test]
+    fn migrate_moves_loose_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path();
+        fs::write(exe.join(CONFIG_FILE), "config").unwrap();
+        fs::write(exe.join(LOG_FILE), "log").unwrap();
+
+        migrate_legacy(exe);
+
+        let dir = exe.join(APP_DIR);
+        assert_eq!(read(dir.join(CONFIG_FILE)), "config");
+        assert_eq!(read(dir.join(LOG_FILE)), "log");
+        assert!(!exe.join(CONFIG_FILE).exists());
+        assert!(!exe.join(LOG_FILE).exists());
+    }
+
+    #[test]
+    fn migrate_keeps_existing_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exe, dir) = (tmp.path(), tmp.path().join(APP_DIR));
+        fs::create_dir(&dir).unwrap();
+        fs::write(exe.join(CONFIG_FILE), "old").unwrap();
+        fs::write(dir.join(CONFIG_FILE), "new").unwrap();
+
+        migrate_legacy(exe);
+
+        assert_eq!(read(exe.join(CONFIG_FILE)), "old");
+        assert_eq!(read(dir.join(CONFIG_FILE)), "new");
     }
 }

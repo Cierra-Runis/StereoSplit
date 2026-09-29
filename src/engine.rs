@@ -20,12 +20,14 @@ use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
     Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Source frames the resampler consumes per step
 const CHUNK_IN: usize = 128;
+
+/// Called from an audio thread when a stream fails (e.g. a speaker was unplugged)
+pub type OnError = Arc<dyn Fn() + Send + Sync>;
 
 pub struct Engine {
     _input: Stream,
@@ -48,9 +50,8 @@ pub fn pick(names: &[String], pat: &str) -> Option<usize> {
 }
 
 fn find_in(devs: impl Iterator<Item = cpal::Device>, pat: &str) -> Option<cpal::Device> {
-    let mut devs: Vec<(String, cpal::Device)> = devs
-        .filter_map(|d| d.name().ok().map(|n| (n, d)))
-        .collect();
+    let mut devs: Vec<(String, cpal::Device)> =
+        devs.filter_map(|d| d.name().ok().map(|n| (n, d))).collect();
     let names: Vec<String> = devs.iter().map(|(n, _)| n.clone()).collect();
     pick(&names, pat).map(|i| devs.swap_remove(i).1)
 }
@@ -193,7 +194,10 @@ impl Feeder {
             let input = InterleavedSlice::new(&self.input[..need], 1, need).ok()?;
             let frames = self.output.len();
             let mut output = InterleavedSlice::new_mut(&mut self.output[..], 1, frames).ok()?;
-            let (_, n) = self.rs.process_into_buffer(&input, &mut output, None).ok()?;
+            let (_, n) = self
+                .rs
+                .process_into_buffer(&input, &mut output, None)
+                .ok()?;
             self.pos = 0;
             self.len = n;
         }
@@ -211,7 +215,7 @@ fn build_output(
     mut cons: HeapCons<f32>,
     target: usize,
     gain: Gain,
-    failed: Arc<AtomicBool>,
+    on_error: OnError,
 ) -> Result<Stream> {
     let name = dev.name().unwrap_or_default();
     let sup = dev
@@ -229,7 +233,9 @@ fn build_output(
     let mut drift = DriftControl::new(target);
     let mut primed = false;
     let mut smooth = gain.get();
-    crate::log(&format!("{label} \"{name}\": {in_rate} Hz -> {out_rate} Hz"));
+    crate::log(&format!(
+        "{label} \"{name}\": {in_rate} Hz -> {out_rate} Hz"
+    ));
 
     let stream = dev.build_output_stream(
         &cfg,
@@ -275,7 +281,7 @@ fn build_output(
         },
         move |e| {
             crate::log(&format!("Output stream error: {e}"));
-            failed.store(true, Ordering::Relaxed);
+            on_error();
         },
         None,
     )?;
@@ -328,7 +334,7 @@ fn test_tone(device: &str) -> Result<()> {
 }
 
 impl Engine {
-    pub fn start(cfg: &Config, gain: Gain, failed: Arc<AtomicBool>) -> Result<Engine> {
+    pub fn start(cfg: &Config, gain: Gain, on_error: OnError) -> Result<Engine> {
         let host = cpal::default_host();
 
         let source = find_source(&host, &cfg.source)?;
@@ -357,14 +363,14 @@ impl Engine {
         in_cfg.buffer_size = BufferSize::Default;
 
         // At least two resampler steps must fit in the buffer, or it would never start playing
-        let target = ((sample_rate as usize * cfg.latency_ms.max(5) as usize) / 1000)
-            .max(CHUNK_IN * 2);
+        let target =
+            ((sample_rate as usize * cfg.latency_ms.max(5) as usize) / 1000).max(CHUNK_IN * 2);
         let cap = sample_rate as usize; // 1 second of capacity, enough to absorb any jitter
 
         let (mut lp, lc): (HeapProd<f32>, HeapCons<f32>) = HeapRb::<f32>::new(cap).split();
         let (mut rp, rc): (HeapProd<f32>, HeapCons<f32>) = HeapRb::<f32>::new(cap).split();
 
-        let f_in = failed.clone();
+        let on_input_error = on_error.clone();
         let input = in_dev.build_input_stream(
             &in_cfg,
             move |data: &[f32], _| {
@@ -378,7 +384,7 @@ impl Engine {
             },
             move |e| {
                 crate::log(&format!("Input stream error: {e}"));
-                f_in.store(true, Ordering::Relaxed);
+                on_input_error();
             },
             None,
         )?;
@@ -390,7 +396,7 @@ impl Engine {
             lc,
             target,
             gain.clone(),
-            failed.clone(),
+            on_error.clone(),
         )?;
         let right = build_output(
             &right_dev,
@@ -399,7 +405,7 @@ impl Engine {
             rc,
             target,
             gain,
-            failed,
+            on_error,
         )?;
         input
             .play()

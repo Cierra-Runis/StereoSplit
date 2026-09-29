@@ -8,8 +8,9 @@ mod volume;
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 use config::Config;
 use tray_icon::menu::{
@@ -36,9 +37,9 @@ const APP_NAME: &str = "Stereo Split";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const LATENCIES: [u32; 4] = [15, 20, 30, 50];
 
-/// Append a line to stereo-split.log next to the exe
+/// Append a line to stereo-split.log in the data folder
 pub fn log(msg: &str) {
-    let path = config::exe_dir().join("stereo-split.log");
+    let path = config::data_dir().join(config::LOG_FILE);
     // Start over once the log exceeds 1 MB
     if std::fs::metadata(&path)
         .map(|m| m.len() > 1_000_000)
@@ -131,10 +132,88 @@ fn make_icon() -> Icon {
     Icon::from_rgba(rgba, N, N).expect("icon")
 }
 
+/// What the supervisor thread waits for
+enum Event {
+    /// Exit was chosen from the tray menu
+    Quit,
+    /// A running audio stream failed (e.g. a speaker was unplugged)
+    Failed,
+    /// config.toml was saved, from the tray menu or by hand
+    ConfigChanged,
+}
+
+/// Report saves of config.toml. The folder is watched rather than the file, since some
+/// editors save by writing a new file and renaming it over the old one.
+fn watch_config(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
+    use notify::{EventKind, RecursiveMode, Watcher};
+    let handler = move |res: notify::Result<notify::Event>| {
+        let Ok(ev) = res else { return };
+        let saved = matches!(
+            ev.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ) && ev
+            .paths
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == config::CONFIG_FILE));
+        if saved {
+            let _ = tx.send(Event::ConfigChanged);
+        }
+    };
+    let watcher = notify::recommended_watcher(handler).and_then(|mut w| {
+        w.watch(config::data_dir(), RecursiveMode::NonRecursive)?;
+        Ok(w)
+    });
+    match watcher {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log(&format!(
+                "Can't watch the config file; changes made by hand need a restart: {e}"
+            ));
+            None
+        }
+    }
+}
+
+/// Let a save settle: one save often arrives as several events (e.g. truncate, then write).
+/// Returns false on quit.
+fn debounce(rx: &Receiver<Event>) -> bool {
+    loop {
+        match rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(Event::Quit) | Err(RecvTimeoutError::Disconnected) => return false,
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => return true,
+        }
+    }
+}
+
+/// Wait for the config to change, or for `timeout` to pass. Returns false on quit.
+/// Failures still queued from an engine that is already gone are skipped here.
+fn wait(rx: &Receiver<Event>, timeout: Option<Duration>) -> bool {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    loop {
+        let ev = match deadline {
+            Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
+                Ok(ev) => ev,
+                Err(RecvTimeoutError::Timeout) => return true,
+                Err(RecvTimeoutError::Disconnected) => return false,
+            },
+            None => match rx.recv() {
+                Ok(ev) => ev,
+                Err(_) => return false,
+            },
+        };
+        match ev {
+            Event::Quit => return false,
+            Event::ConfigChanged => return debounce(rx),
+            Event::Failed => {}
+        }
+    }
+}
+
 /// Audio supervisor thread: starts the engine, retries automatically after errors (e.g. a
 /// speaker being unplugged), and restarts with the new config whenever config.toml changes
 /// (whether from the tray menu or edited by hand).
-fn spawn_supervisor(quit: Arc<AtomicBool>, status: Arc<Mutex<String>>) {
+fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<String>>) {
     std::thread::spawn(move || {
         let set_status = |s: &str| *status.lock().unwrap() = s.into();
         let mut shown_error: Option<String> = None;
@@ -142,8 +221,12 @@ fn spawn_supervisor(quit: Arc<AtomicBool>, status: Arc<Mutex<String>>) {
         // Whether this process has made the source the default playback device
         let mut managed = false;
 
-        while !quit.load(Ordering::Relaxed) {
-            let stamp = config::modified();
+        let _watcher = watch_config(tx.clone());
+        let on_error: engine::OnError = Arc::new(move || {
+            let _ = tx.send(Event::Failed);
+        });
+
+        loop {
             let cfg = match config::load() {
                 Ok(c) => c,
                 Err(e) => {
@@ -154,7 +237,9 @@ fn spawn_supervisor(quit: Arc<AtomicBool>, status: Arc<Mutex<String>>) {
                         message_box(&msg, true);
                         shown_error = Some(msg);
                     }
-                    wait_for_change(&quit, stamp);
+                    if !wait(&rx, None) {
+                        break;
+                    }
                     continue;
                 }
             };
@@ -170,7 +255,9 @@ fn spawn_supervisor(quit: Arc<AtomicBool>, status: Arc<Mutex<String>>) {
                         false,
                     );
                 }
-                wait_for_change(&quit, stamp);
+                if !wait(&rx, None) {
+                    break;
+                }
                 continue;
             }
 
@@ -178,8 +265,7 @@ fn spawn_supervisor(quit: Arc<AtomicBool>, status: Arc<Mutex<String>>) {
             let gain = volume::Gain::new(1.0);
             volume::spawn_watcher(cfg.volume_endpoint.clone(), gain.clone(), vol_stop.clone());
 
-            let failed = Arc::new(AtomicBool::new(false));
-            match engine::Engine::start(&cfg, gain, failed.clone()) {
+            let go_on = match engine::Engine::start(&cfg, gain, on_error.clone()) {
                 Ok(engine) => {
                     shown_error = None;
                     set_status("Running");
@@ -187,17 +273,18 @@ fn spawn_supervisor(quit: Arc<AtomicBool>, status: Arc<Mutex<String>>) {
                         Ok(()) => managed = true,
                         Err(e) => log(&format!("{e:#}")),
                     }
-                    while !quit.load(Ordering::Relaxed)
-                        && config::modified() == stamp
-                        && !failed.load(Ordering::Relaxed)
-                    {
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
+                    let ev = rx.recv().unwrap_or(Event::Quit);
+                    // Dropping the streams joins their threads, so no more failures
+                    // can arrive from this engine
                     drop(engine);
-                    if failed.load(Ordering::Relaxed) {
-                        log("Audio interrupted, reconnecting in 2 seconds");
-                        set_status("Reconnecting");
-                        std::thread::sleep(Duration::from_secs(2));
+                    match ev {
+                        Event::Quit => false,
+                        Event::ConfigChanged => debounce(&rx),
+                        Event::Failed => {
+                            log("Audio interrupted, reconnecting in 2 seconds");
+                            set_status("Reconnecting");
+                            wait(&rx, Some(Duration::from_secs(2)))
+                        }
                     }
                 }
                 Err(e) => {
@@ -218,15 +305,13 @@ fn spawn_supervisor(quit: Arc<AtomicBool>, status: Arc<Mutex<String>>) {
                         );
                         shown_error = Some(msg);
                     }
-                    for _ in 0..15 {
-                        if quit.load(Ordering::Relaxed) || config::modified() != stamp {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
+                    wait(&rx, Some(Duration::from_secs(3)))
                 }
-            }
+            };
             vol_stop.store(true, Ordering::Relaxed);
+            if !go_on {
+                break;
+            }
         }
     });
 }
@@ -237,12 +322,6 @@ fn release(cfg: &Config, managed: &mut bool) {
         if let Err(e) = default_device::restore(cfg) {
             log(&format!("{e:#}"));
         }
-    }
-}
-
-fn wait_for_change(quit: &AtomicBool, stamp: Option<SystemTime>) {
-    while !quit.load(Ordering::Relaxed) && config::modified() == stamp {
-        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -464,7 +543,7 @@ impl Tray {
             None
         } else if id == self.view_log.id() {
             let _ = std::process::Command::new("notepad")
-                .arg(config::exe_dir().join("stereo-split.log"))
+                .arg(config::data_dir().join(config::LOG_FILE))
                 .spawn();
             None
         } else {
@@ -578,9 +657,9 @@ fn main() {
     default_device::spawn_guard();
     create_session_window();
 
-    let quit = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
     let status = Arc::new(Mutex::new(String::from("Starting")));
-    spawn_supervisor(quit.clone(), status.clone());
+    spawn_supervisor(tx.clone(), rx, status.clone());
 
     let mut tray = Tray::new();
     tray.refresh();
@@ -622,7 +701,7 @@ fn main() {
 
             while let Ok(ev) = menu_rx.try_recv() {
                 if ev.id == *tray.quit.id() {
-                    quit.store(true, Ordering::Relaxed);
+                    let _ = tx.send(Event::Quit);
                     PostQuitMessage(0);
                 } else {
                     tray.handle(&ev.id);
