@@ -283,7 +283,7 @@ impl Tray {
             }
             None
         } else if id == self.open_config.id() {
-            let _ = std::process::Command::new("notepad")
+            let _ = std::process::Command::new("explorer")
                 .arg(config::config_path())
                 .spawn();
             None
