@@ -4,26 +4,20 @@
 //! Windows has no public API for changing the default device; everyone (SoundSwitch,
 //! EarTrumpet, ...) uses the undocumented `IPolicyConfig` interface, as done here.
 //!
-//! Restoring happens in several places so the PC never ends up silent:
-//! - on normal exit, on logoff/shutdown, and from the panic hook (in-process)
-//! - from a guard process (this same exe with `--guard <pid>`) that waits for the main
-//!   process to end for any reason, including a crash or being killed from Task Manager
+//! Restoring happens on normal exit, on logoff/shutdown, and from the panic hook. After any
+//! other crash Windows restarts the program, which brings the sound back. Being killed from
+//! Task Manager leaves the source as the default until the program is started again.
 
 use crate::config::{self, Config};
 use crate::devices::{com_init, device_id, enumerator, find_render_device};
 use anyhow::{anyhow, Context, Result};
-use std::path::Path;
 use std::sync::Mutex;
 use tracing::{error, info};
 
 use policy::IPolicyConfig;
 use windows::core::{GUID, HSTRING, PCWSTR};
-use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Media::Audio::{eConsole, eMultimedia, eRender, DEVICE_STATE_ACTIVE};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
-use windows::Win32::System::Threading::{
-    OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
-};
 
 // In its own module because the interface macro accepts no attributes to silence lints
 #[allow(non_snake_case, dead_code)]
@@ -194,39 +188,10 @@ fn try_restore(cfg: &Config) -> Result<()> {
     }
 }
 
-/// Restore using the config on disk. Used on exit, from the panic hook and from the guard,
-/// where no config is at hand.
+/// Restore using the config on disk. Used on exit and from the panic hook, where no config
+/// is at hand.
 pub fn restore_from_disk() {
     if let Ok(cfg) = config::load() {
         restore(&cfg);
     }
-}
-
-/// Start the guard process for the current process. It logs to `log_file` too.
-pub fn spawn_guard(log_file: Option<&Path>) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let spawned = std::env::current_exe().and_then(|exe| {
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("--guard").arg(std::process::id().to_string());
-        if let Some(f) = log_file {
-            cmd.arg(f);
-        }
-        cmd.creation_flags(CREATE_NO_WINDOW).spawn()
-    });
-    if let Err(e) = spawned {
-        error!(error = %e, "failed to start the guard process");
-    }
-}
-
-/// Guard process body: wait for the main process to end, however it ends, then restore
-pub fn run_guard(pid: u32) {
-    unsafe {
-        // If it can't be opened, it has already exited
-        if let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-            WaitForSingleObject(h, INFINITE);
-            let _ = CloseHandle(h);
-        }
-    }
-    restore_from_disk();
 }

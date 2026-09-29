@@ -9,7 +9,7 @@ Splits your PC's audio into its left and right channels and sends each one to a 
 3. Reads the volume and mute state you set for CABLE Input in Windows and applies them to both speakers in real time, so the keyboard volume keys and the taskbar volume slider work as usual.
 4. Resamples for each speaker on its own, so the speakers and CABLE Input can use different sample rates.
 5. Corrects clock drift between the two speakers automatically by adjusting each speaker's playback speed very slightly, so left and right stay in sync even during long playback.
-6. Makes CABLE Input the default playback device while it runs, and switches back to your speaker when it exits. A small guard process does the same if the program crashes or is killed, so your PC is never left silent.
+6. Makes CABLE Input the default playback device while it runs, and switches back to your speaker when it exits. If it crashes, Windows restarts it automatically.
 7. Reconnects automatically when a speaker is unplugged and plugged back in, lives in the system tray, and can start with Windows.
 
 ## First-time setup
@@ -67,6 +67,8 @@ Right-click the tray icon and check "Start with Windows".
 **The tray shows "microphone in use"**: Open `config.toml` and make sure `source = "CABLE Input"` (older versions defaulted to CABLE Output).
 
 **Going back to normal**: Just exit the program; the default playback device switches back to the speaker you used before.
+
+**No sound after ending it from Task Manager**: Ending the program that way skips switching back. Start it again and choose "Exit", or pick your speaker in the taskbar's sound menu.
 
 ## Building from source
 

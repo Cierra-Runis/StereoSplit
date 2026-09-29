@@ -4,7 +4,6 @@
 
 use crate::config;
 use std::fs::OpenOptions;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::ChronoLocal;
@@ -19,17 +18,14 @@ fn timer() -> ChronoLocal {
     ChronoLocal::new(TIME_FORMAT.into())
 }
 
-/// Log to `file` (the guard process appends to its parent's file), or to a new file for this
-/// run. Returns the file in use. Failures are ignored: the program works the same without a log.
-pub fn init(file: Option<PathBuf>) -> Option<PathBuf> {
-    let path = file.unwrap_or_else(|| {
-        let name = chrono::Utc::now().format("%Y%m%dT%H%M%SZ.log").to_string();
-        config::log_dir().join(name)
-    });
+/// Log to a new file for this run. Failures are ignored: the program works the same without
+/// a log.
+pub fn init() {
+    let name = chrono::Utc::now().format("%Y%m%dT%H%M%SZ.log").to_string();
+    let path = config::log_dir().join(name);
     let opened = std::fs::create_dir_all(config::log_dir())
         .and_then(|()| OpenOptions::new().create(true).append(true).open(&path))
         .ok();
-    let used = opened.as_ref().map(|_| path);
 
     // `File` is unbuffered, so every line is on disk before a panic aborts the process
     let file_layer = opened.map(|f| {
@@ -53,5 +49,4 @@ pub fn init(file: Option<PathBuf>) -> Option<PathBuf> {
         .with(file_layer)
         .with(stderr_layer)
         .try_init();
-    used
 }

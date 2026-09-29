@@ -14,7 +14,7 @@ mod volume;
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -264,16 +264,6 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("--guard") {
-        // Append to the main process's log file rather than start one per guard
-        logging::init(args.get(3).map(PathBuf::from));
-        if let Some(pid) = args.get(2).and_then(|s| s.parse().ok()) {
-            default_device::run_guard(pid);
-        }
-        return;
-    }
-
     if session::already_running() {
         toast::show(
             "Already running",
@@ -282,11 +272,11 @@ fn main() {
         return;
     }
     // Only now, so a second copy that exits right away leaves no log file behind
-    let log_file = logging::init(None);
+    logging::init();
     info!(version = env!("CARGO_PKG_VERSION"), "program started");
 
-    // Never leave the PC silent: switch the default device back on a panic, restart
-    // automatically after a crash, and let a guard process clean up if this one is killed
+    // Never leave the PC silent: switch the default device back on a panic, and restart
+    // automatically after any other crash
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         error!(panic = %info, "panic");
@@ -296,7 +286,6 @@ fn main() {
     unsafe {
         let _ = RegisterApplicationRestart(PCWSTR::null(), RESTART_NO_REBOOT);
     }
-    default_device::spawn_guard(log_file.as_deref());
     session::create_window();
 
     let (tx, rx) = mpsc::channel();
