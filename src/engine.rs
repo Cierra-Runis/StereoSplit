@@ -14,7 +14,7 @@ use crate::devices;
 use crate::volume::Gain;
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, ErrorKind, SampleFormat, Stream, StreamConfig};
+use cpal::{ErrorKind, SampleFormat, Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
@@ -127,21 +127,35 @@ fn find_in(host: &cpal::Host, pat: &str, output: bool) -> Result<Option<cpal::De
     Ok(devices::pick_from(devs, pat))
 }
 
-/// Sound source. A matching playback device is preferred and read via loopback capture,
-/// so no recording device is opened and Windows does not show "microphone in use".
-/// Only if no playback device matches does it fall back to a recording device
-/// (the older "CABLE Output" config still works).
-enum Source {
-    Loopback(cpal::Device),
-    Recording(cpal::Device),
+/// The default format of `dev` for playback (or for recording, if `output` is false).
+/// Only 32-bit float samples are supported.
+fn f32_config(dev: &cpal::Device, output: bool) -> Result<StreamConfig> {
+    let name = || device_name(dev).unwrap_or_default();
+    let sup = if output {
+        dev.default_output_config()
+    } else {
+        dev.default_input_config()
+    }
+    .with_context(|| format!("Failed to read the format of \"{}\"", name()))?;
+    if sup.sample_format() != SampleFormat::F32 {
+        bail!(
+            "\"{}\" does not use 32-bit float samples, which is not supported yet",
+            name()
+        );
+    }
+    Ok(sup.config())
 }
 
-fn find_source(host: &cpal::Host, pat: &str) -> Result<Source> {
-    if let Some(d) = find_in(host, pat, true)? {
-        return Ok(Source::Loopback(d));
-    }
-    if let Some(d) = find_in(host, pat, false)? {
-        return Ok(Source::Recording(d));
+/// Sound source, its format and how it is read. A matching playback device is preferred and
+/// read via loopback capture (in its playback format), so no recording device is opened and
+/// Windows does not show "microphone in use". Only if no playback device matches does it
+/// fall back to a recording device (the older "CABLE Output" config still works).
+fn find_source(host: &cpal::Host, pat: &str) -> Result<(cpal::Device, StreamConfig, &'static str)> {
+    for (output, mode) in [(true, "loopback capture"), (false, "recording device")] {
+        if let Some(d) = find_in(host, pat, output)? {
+            let config = f32_config(&d, output)?;
+            return Ok((d, config, mode));
+        }
     }
     bail!("Sound source \"{pat}\" not found. Make sure VB-CABLE is installed.")
 }
@@ -280,26 +294,18 @@ fn build_output(
     gain: Gain,
     on_error: OnError,
 ) -> Result<Stream> {
-    let name = device_name(dev).unwrap_or_default();
-    let sup = dev
-        .default_output_config()
-        .with_context(|| format!("Failed to read the output format of \"{name}\""))?;
-    if sup.sample_format() != SampleFormat::F32 {
-        bail!("\"{name}\" does not use 32-bit float samples, which is not supported yet");
-    }
-    let out_rate = sup.sample_rate();
-    let channels = sup.channels() as usize;
-    let mut cfg: StreamConfig = sup.config();
-    cfg.buffer_size = BufferSize::Default;
-
+    let config = f32_config(dev, true)?;
+    let out_rate = config.sample_rate;
+    let channels = config.channels as usize;
     let mut feeder = Feeder::new(in_rate, out_rate)?;
     let mut drift = DriftControl::new(target);
     let mut primed = false;
     let mut smooth = gain.get();
-    info!(%side, device = %name, in_rate, out_rate, "output resampling");
+    let device = device_name(dev).unwrap_or_default();
+    info!(%side, device, in_rate, out_rate, "output resampling");
 
     let stream = dev.build_output_stream(
-        cfg,
+        config,
         move |data: &mut [f32], _| {
             let tgt = gain.get();
             let avail = cons.occupied_len();
@@ -365,15 +371,12 @@ fn test_tone(device: &str) -> Result<()> {
 
     let host = cpal::default_host();
     let dev = find_output(&host, device)?;
-    let sup = dev.default_output_config()?;
-    if sup.sample_format() != SampleFormat::F32 {
-        bail!("the device does not use 32-bit float samples");
-    }
-    let rate = sup.sample_rate() as f32;
-    let channels = sup.channels() as usize;
+    let config = f32_config(&dev, true)?;
+    let rate = config.sample_rate as f32;
+    let channels = config.channels as usize;
     let mut n = 0u32;
     let stream = dev.build_output_stream(
-        sup.config(),
+        config,
         move |data: &mut [f32], _| {
             for frame in data.chunks_mut(channels) {
                 let t = n as f32 / rate;
@@ -396,30 +399,11 @@ impl Engine {
     pub fn start(cfg: &Config, gain: Gain, on_error: OnError) -> Result<Engine> {
         let host = cpal::default_host();
 
-        let source = find_source(&host, &cfg.source)?;
+        let (in_dev, in_cfg, mode) = find_source(&host, &cfg.source)?;
         let left_dev = find_output(&host, &cfg.left)?;
         let right_dev = find_output(&host, &cfg.right)?;
-
-        // Loopback capture uses the playback device's own format; a recording device uses its input format
-        let (in_dev, sup, mode) = match source {
-            Source::Loopback(d) => {
-                let sup = d.default_output_config();
-                (d, sup, "loopback capture")
-            }
-            Source::Recording(d) => {
-                let sup = d.default_input_config();
-                (d, sup, "recording device")
-            }
-        };
-        let in_name = device_name(&in_dev).unwrap_or_default();
-        let sup = sup.with_context(|| format!("Failed to read the format of \"{in_name}\""))?;
-        if sup.sample_format() != SampleFormat::F32 {
-            bail!("\"{in_name}\" does not use 32-bit float samples, which is not supported yet");
-        }
-        let sample_rate = sup.sample_rate();
-        let in_ch = sup.channels() as usize;
-        let mut in_cfg: StreamConfig = sup.config();
-        in_cfg.buffer_size = BufferSize::Default;
+        let sample_rate = in_cfg.sample_rate;
+        let in_ch = in_cfg.channels as usize;
 
         // At least two resampler steps must fit in the buffer, or it would never start playing
         let target =
@@ -468,7 +452,7 @@ impl Engine {
 
         info!(
             mode,
-            input = %in_name,
+            input = %device_name(&in_dev).unwrap_or_default(),
             left = %device_name(&left_dev).unwrap_or_default(),
             right = %device_name(&right_dev).unwrap_or_default(),
             sample_rate,
