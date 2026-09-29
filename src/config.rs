@@ -47,6 +47,13 @@ pub struct Config {
     pub volume_endpoint: String,
 }
 
+impl Config {
+    /// The left and right speaker
+    pub fn speakers(&self) -> [&str; 2] {
+        [&self.left, &self.right]
+    }
+}
+
 /// `text` with the values from `cfg` put in. Everything else in it (comments, order, layout)
 /// is kept as is.
 fn update(text: &str, cfg: &Config) -> Result<String> {

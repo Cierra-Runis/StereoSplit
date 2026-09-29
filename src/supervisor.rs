@@ -5,7 +5,7 @@
 //! [`spawn`] runs it on a thread and carries out what it decides.
 
 use crate::config::{self, Config};
-use crate::engine::{self, Engine};
+use crate::engine::{self, Engine, StreamKind};
 use crate::{default_device, device_watch, toast, volume};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -32,8 +32,7 @@ pub enum Event {
         /// Of the engine it came from, since a stopped engine can still report failures
         /// for a while
         generation: u64,
-        /// "input", "left" or "right"
-        stream: &'static str,
+        stream: StreamKind,
     },
     /// config.toml was saved, from the tray menu or by hand
     ConfigChanged,
@@ -54,10 +53,10 @@ enum State {
         cfg: Config,
         generation: u64,
     },
-    /// The engine lost the device of its `lost` stream ("input", "left" or "right") and is
-    /// started again with the same config; `error` is why the last try failed
+    /// The engine lost the device of its `lost` stream and is started again with the same
+    /// config; `error` is why the last try failed
     Reconnecting {
-        lost: &'static str,
+        lost: StreamKind,
         error: Option<String>,
     },
     /// Failed to start; tries again when a device changes
@@ -83,7 +82,7 @@ impl State {
         *self = match (&*self, new) {
             // Failing to start the same config again is still reconnecting
             (State::Reconnecting { lost, .. }, State::Failed(e)) => State::Reconnecting {
-                lost,
+                lost: *lost,
                 error: Some(e),
             },
             (_, new) => new,
@@ -143,11 +142,11 @@ impl State {
                     .into(),
             )),
             (State::Running { cfg, .. }, State::Reconnecting { lost, .. }) => {
-                warn!(stream = *lost, "audio interrupted, reconnecting");
-                let (what, name) = match *lost {
-                    "left" => ("Left speaker", &cfg.left),
-                    "right" => ("Right speaker", &cfg.right),
-                    _ => ("Sound source", &cfg.source),
+                warn!(stream = %lost, "audio interrupted, reconnecting");
+                let (what, name) = match lost {
+                    StreamKind::Input => ("Sound source", &cfg.source),
+                    StreamKind::Left => ("Left speaker", &cfg.left),
+                    StreamKind::Right => ("Right speaker", &cfg.right),
                 };
                 Some((
                     format!("{what} disconnected"),
@@ -362,7 +361,7 @@ mod tests {
         let lost = step(&mut s, |s| {
             s.on_event(Event::Failed {
                 generation: 1,
-                stream: "left",
+                stream: StreamKind::Left,
             })
         });
         assert_eq!(lost.as_deref(), Some("Left speaker disconnected"));
@@ -391,7 +390,7 @@ mod tests {
         let mut s = running();
         let stale = Event::Failed {
             generation: 0,
-            stream: "left",
+            stream: StreamKind::Left,
         };
         assert_eq!(s.on_event(stale), None);
         assert_eq!(s, running());

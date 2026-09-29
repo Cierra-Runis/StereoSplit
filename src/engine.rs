@@ -27,9 +27,28 @@ use tracing::{debug, error, info, warn};
 /// Source frames the resampler consumes per step
 const CHUNK_IN: usize = 128;
 
+/// One of the engine's three streams
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Input,
+    Left,
+    Right,
+}
+
+/// Lowercase, as it appears in the log
+impl std::fmt::Display for StreamKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            StreamKind::Input => "input",
+            StreamKind::Left => "left",
+            StreamKind::Right => "right",
+        })
+    }
+}
+
 /// Called from an audio thread when a stream fails (e.g. a speaker was unplugged), with the
-/// stream that failed: "input", "left" or "right"
-pub type OnError = Arc<dyn Fn(&'static str) + Send + Sync>;
+/// stream that failed
+pub type OnError = Arc<dyn Fn(StreamKind) + Send + Sync>;
 
 pub struct Engine {
     streams: Vec<Stream>,
@@ -57,17 +76,17 @@ impl Drop for Engine {
 }
 
 /// Error callback for a stream: logs the error, and reports it through `on_error` unless the
-/// stream keeps running anyway. `stream` is "input", "left" or "right".
-fn on_stream_error(stream: &'static str, on_error: OnError) -> impl FnMut(cpal::Error) + Send {
+/// stream keeps running anyway.
+fn on_stream_error(stream: StreamKind, on_error: OnError) -> impl FnMut(cpal::Error) + Send {
     move |e| match e.kind() {
         // Some audio was dropped (e.g. after a brief system stall), but the stream goes on
-        ErrorKind::Xrun => debug!(stream, "buffer overrun or underrun"),
+        ErrorKind::Xrun => debug!(%stream, "buffer overrun or underrun"),
         ErrorKind::DeviceNotAvailable => {
-            warn!(stream, "device disconnected");
+            warn!(%stream, "device disconnected");
             on_error(stream);
         }
         _ => {
-            error!(stream, error = %e, "stream error");
+            error!(%stream, error = %e, "stream error");
             on_error(stream);
         }
     }
@@ -265,10 +284,10 @@ impl Feeder {
     }
 }
 
-/// Output stream for one speaker. `side` is "left" or "right".
+/// Output stream for one speaker
 fn build_output(
     dev: &cpal::Device,
-    side: &'static str,
+    side: StreamKind,
     in_rate: u32,
     mut cons: HeapCons<f32>,
     target: usize,
@@ -291,7 +310,7 @@ fn build_output(
     let mut drift = DriftControl::new(target);
     let mut primed = false;
     let mut smooth = gain.get();
-    info!(side, device = %name, in_rate, out_rate, "output resampling");
+    info!(%side, device = %name, in_rate, out_rate, "output resampling");
 
     let stream = dev.build_output_stream(
         cfg,
@@ -435,20 +454,28 @@ impl Engine {
                     let _ = rp.try_push(r);
                 }
             },
-            on_stream_error("input", on_error.clone()),
+            on_stream_error(StreamKind::Input, on_error.clone()),
             None,
         )?;
 
         let left = build_output(
             &left_dev,
-            "left",
+            StreamKind::Left,
             sample_rate,
             lc,
             target,
             gain.clone(),
             on_error.clone(),
         )?;
-        let right = build_output(&right_dev, "right", sample_rate, rc, target, gain, on_error)?;
+        let right = build_output(
+            &right_dev,
+            StreamKind::Right,
+            sample_rate,
+            rc,
+            target,
+            gain,
+            on_error,
+        )?;
         input
             .play()
             .map_err(|e| anyhow!("Failed to start capturing sound: {e}"))?;

@@ -90,8 +90,13 @@ fn edit_config(f: impl FnOnce(&mut Config)) -> Option<Config> {
     }
 }
 
-/// Put `name` on one side. If it was on the other side, the two sides swap.
-fn choose(this: &mut String, other: &mut String, name: &str, devices: &[String]) {
+/// Put `name` on `side` (0 = left, 1 = right). If it was on the other side, the two sides swap.
+fn choose(cfg: &mut Config, side: usize, name: &str, devices: &[String]) {
+    let (this, other) = if side == 0 {
+        (&mut cfg.left, &mut cfg.right)
+    } else {
+        (&mut cfg.right, &mut cfg.left)
+    };
     if engine::pick(devices, other) == engine::pick(devices, name) {
         *other = this.clone();
     }
@@ -103,18 +108,32 @@ fn menu_text(s: &str) -> String {
     s.replace('&', "&&")
 }
 
+/// The menu items for one speaker
+struct SideMenu {
+    /// Lists the speakers in `Tray::devices`, one item each, in the same order
+    menu: Submenu,
+    items: Vec<CheckMenuItem>,
+    test: MenuItem,
+}
+
+impl SideMenu {
+    fn new(menu: &str, test: &str) -> SideMenu {
+        SideMenu {
+            menu: Submenu::new(menu, true),
+            items: Vec::new(),
+            test: MenuItem::new(test, true, None),
+        }
+    }
+}
+
 struct Tray {
     menu: Menu,
     status: MenuItem,
-    left: Submenu,
-    right: Submenu,
-    /// Speakers currently listed in the Left/Right submenus; item ids index into this
+    /// Speakers currently listed in the Left/Right submenus
     devices: Vec<String>,
-    left_items: Vec<CheckMenuItem>,
-    right_items: Vec<CheckMenuItem>,
+    /// Left and right, in the order of [`Config::speakers`]
+    sides: [SideMenu; 2],
     swap: MenuItem,
-    test_left: MenuItem,
-    test_right: MenuItem,
     latency: Vec<(u32, CheckMenuItem)>,
     auto: CheckMenuItem,
     open_config: MenuItem,
@@ -128,13 +147,7 @@ impl Tray {
         let latency: Vec<(u32, CheckMenuItem)> = LATENCIES
             .iter()
             .map(|&ms| {
-                let item = CheckMenuItem::with_id(
-                    format!("latency:{ms}"),
-                    format!("{ms} ms"),
-                    true,
-                    false,
-                    None,
-                );
+                let item = CheckMenuItem::new(format!("{ms} ms"), true, false, None);
                 let _ = latency_menu.append(&item);
                 (ms, item)
             })
@@ -143,28 +156,27 @@ impl Tray {
         let tray = Tray {
             menu: Menu::new(),
             status: MenuItem::new("Status: Starting", false, None),
-            left: Submenu::new("Left speaker", true),
-            right: Submenu::new("Right speaker", true),
             devices: Vec::new(),
-            left_items: Vec::new(),
-            right_items: Vec::new(),
+            sides: [
+                SideMenu::new("Left speaker", "Test left"),
+                SideMenu::new("Right speaker", "Test right"),
+            ],
             swap: MenuItem::new("Swap left / right", true, None),
-            test_left: MenuItem::new("Test left", true, None),
-            test_right: MenuItem::new("Test right", true, None),
             latency,
             auto: CheckMenuItem::new("Start with Windows", true, autostart_enabled(), None),
             open_config: MenuItem::new("Open config file", true, None),
             view_log: MenuItem::new("Open log folder", true, None),
             quit: MenuItem::new("Exit", true, None),
         };
+        let [left, right] = &tray.sides;
         let _ = tray.menu.append_items(&[
             &tray.status,
             &PredefinedMenuItem::separator(),
-            &tray.left,
-            &tray.right,
+            &left.menu,
+            &right.menu,
             &tray.swap,
-            &tray.test_left,
-            &tray.test_right,
+            &left.test,
+            &right.test,
             &PredefinedMenuItem::separator(),
             &latency_menu,
             &tray.auto,
@@ -206,25 +218,20 @@ impl Tray {
     }
 
     fn rebuild_devices(&mut self, devices: Vec<String>) {
-        for (menu, items, side) in [
-            (&self.left, &mut self.left_items, "left"),
-            (&self.right, &mut self.right_items, "right"),
-        ] {
-            while menu.remove_at(0).is_some() {}
-            items.clear();
-            for (i, name) in devices.iter().enumerate() {
-                let item = CheckMenuItem::with_id(
-                    format!("{side}:{i}"),
-                    menu_text(name),
-                    true,
-                    false,
-                    None,
-                );
-                let _ = menu.append(&item);
-                items.push(item);
-            }
+        for side in &mut self.sides {
+            while side.menu.remove_at(0).is_some() {}
+            side.items = devices
+                .iter()
+                .map(|name| {
+                    let item = CheckMenuItem::new(menu_text(name), true, false, None);
+                    let _ = side.menu.append(&item);
+                    item
+                })
+                .collect();
             if devices.is_empty() {
-                let _ = menu.append(&MenuItem::new("(No speakers found)", false, None));
+                let _ = side
+                    .menu
+                    .append(&MenuItem::new("(No speakers found)", false, None));
             }
         }
         self.devices = devices;
@@ -232,48 +239,36 @@ impl Tray {
 
     /// Set every check mark from the config
     fn sync(&self, cfg: &Config) {
-        let l = engine::pick(&self.devices, &cfg.left);
-        let r = engine::pick(&self.devices, &cfg.right);
-        for (i, item) in self.left_items.iter().enumerate() {
-            item.set_checked(l == Some(i));
+        for (side, speaker) in self.sides.iter().zip(cfg.speakers()) {
+            let chosen = engine::pick(&self.devices, speaker);
+            for (i, item) in side.items.iter().enumerate() {
+                item.set_checked(chosen == Some(i));
+            }
+            side.test.set_enabled(chosen.is_some());
         }
-        for (i, item) in self.right_items.iter().enumerate() {
-            item.set_checked(r == Some(i));
-        }
-        self.test_left.set_enabled(l.is_some());
-        self.test_right.set_enabled(r.is_some());
         for (ms, item) in &self.latency {
             item.set_checked(*ms == cfg.latency_ms);
         }
     }
 
     fn handle(&mut self, id: &MenuId) {
-        let id_str = id.as_ref();
-        let index = |prefix: &str| -> Option<usize> {
-            id_str
-                .strip_prefix(prefix)?
-                .parse()
-                .ok()
-                .filter(|&i| i < self.devices.len())
-        };
-        let devices = self.devices.clone();
+        let devices = &self.devices;
+        let speaker = self.sides.iter().enumerate().find_map(|(side, menu)| {
+            let i = menu.items.iter().position(|item| item.id() == id)?;
+            Some((side, i))
+        });
+        let test = self.sides.iter().position(|menu| menu.test.id() == id);
+        let latency = self.latency.iter().find(|(_, item)| item.id() == id);
 
-        let edited = if let Some(i) = index("left:") {
-            edit_config(|c| choose(&mut c.left, &mut c.right, &devices[i], &devices))
-        } else if let Some(i) = index("right:") {
-            edit_config(|c| choose(&mut c.right, &mut c.left, &devices[i], &devices))
-        } else if let Some(ms) = id_str.strip_prefix("latency:").and_then(|s| s.parse().ok()) {
+        let edited = if let Some((side, i)) = speaker {
+            edit_config(|c| choose(c, side, &devices[i], devices))
+        } else if let Some(&(ms, _)) = latency {
             edit_config(|c| c.latency_ms = ms)
         } else if id == self.swap.id() {
             edit_config(|c| std::mem::swap(&mut c.left, &mut c.right))
-        } else if id == self.test_left.id() || id == self.test_right.id() {
+        } else if let Some(side) = test {
             if let Ok(cfg) = config::load() {
-                let side = if id == self.test_left.id() {
-                    &cfg.left
-                } else {
-                    &cfg.right
-                };
-                if let Some(i) = engine::pick(&devices, side) {
+                if let Some(i) = engine::pick(devices, cfg.speakers()[side]) {
                     engine::play_test_tone(devices[i].clone());
                 }
             }
