@@ -86,31 +86,12 @@ fn choose_dir(exe_dir: &Path, local_appdata: Option<PathBuf>) -> PathBuf {
     local_appdata.map_or(portable, |d| d.join(APP_DIR))
 }
 
-/// Older versions kept their files loose next to the exe; move them into the data folder
-/// there, which keeps such an install portable. Must not log (logging needs `data_dir`).
-fn migrate_legacy(exe_dir: &Path) {
-    let dir = exe_dir.join(APP_DIR);
-    if !exe_dir.join(CONFIG_FILE).exists() || dir.join(CONFIG_FILE).exists() {
-        return;
-    }
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    for name in [CONFIG_FILE, RESTORE_FILE] {
-        let old = exe_dir.join(name);
-        if old.exists() {
-            let _ = std::fs::rename(&old, dir.join(name));
-        }
-    }
-}
-
 /// Folder holding the config file, the logs and the saved default device. Debug builds always
 /// use the one next to the exe (in target/), so they never touch an installed copy's data.
 pub fn data_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let exe = exe_dir();
-        migrate_legacy(&exe);
         let dir = if cfg!(debug_assertions) {
             exe.join(APP_DIR)
         } else {
@@ -163,10 +144,6 @@ pub fn save(cfg: &Config) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
-
-    fn read(path: impl AsRef<Path>) -> String {
-        fs::read_to_string(path).unwrap()
-    }
 
     #[test]
     fn new_file_has_every_key_commented() {
@@ -231,35 +208,5 @@ mod tests {
         fs::create_dir_all(&portable).unwrap();
         fs::write(portable.join(CONFIG_FILE), "").unwrap();
         assert_eq!(choose_dir(&exe, Some(appdata)), portable);
-    }
-
-    #[test]
-    fn migrate_moves_loose_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp.path();
-        fs::write(exe.join(CONFIG_FILE), "config").unwrap();
-        fs::write(exe.join(RESTORE_FILE), "device").unwrap();
-
-        migrate_legacy(exe);
-
-        let dir = exe.join(APP_DIR);
-        assert_eq!(read(dir.join(CONFIG_FILE)), "config");
-        assert_eq!(read(dir.join(RESTORE_FILE)), "device");
-        assert!(!exe.join(CONFIG_FILE).exists());
-        assert!(!exe.join(RESTORE_FILE).exists());
-    }
-
-    #[test]
-    fn migrate_keeps_existing_data() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (exe, dir) = (tmp.path(), tmp.path().join(APP_DIR));
-        fs::create_dir(&dir).unwrap();
-        fs::write(exe.join(CONFIG_FILE), "old").unwrap();
-        fs::write(dir.join(CONFIG_FILE), "new").unwrap();
-
-        migrate_legacy(exe);
-
-        assert_eq!(read(exe.join(CONFIG_FILE)), "old");
-        assert_eq!(read(dir.join(CONFIG_FILE)), "new");
     }
 }
