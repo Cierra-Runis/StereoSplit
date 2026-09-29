@@ -5,13 +5,18 @@
 //! So this program reads that volume and applies it itself, which lets the keyboard volume
 //! keys control both speakers.
 
-use crate::default_device::find_render_device;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use crate::default_device::{device_id, find_render_device};
+use crate::device_watch::DeviceWatch;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::core::implement;
+use windows::Win32::Media::Audio::Endpoints::{
+    IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
+};
+use windows::Win32::Media::Audio::{IMMDevice, AUDIO_VOLUME_NOTIFICATION_DATA};
 use windows::Win32::System::Com::{CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
 
 /// Shared gain value (the f32 bit pattern is stored in an AtomicU32)
@@ -30,64 +35,164 @@ impl Gain {
     }
 }
 
-unsafe fn find_endpoint(pattern: &str) -> windows::core::Result<Option<IAudioEndpointVolume>> {
-    match find_render_device(pattern)? {
-        Some(dev) => Ok(Some(dev.Activate(CLSCTX_ALL, None)?)),
-        None => Ok(None),
+/// What the follower thread waits for
+enum Msg {
+    /// The volume or mute state of the followed device changed
+    Volume,
+    /// A device appeared, disappeared or changed state
+    Devices,
+    Stop,
+}
+
+/// Keeps a [`Gain`] at the Windows volume of the playback device matching `pattern`, for as
+/// long as it is alive. Windows reports every change, so nothing is polled.
+pub struct Follower {
+    pattern: String,
+    gain: Gain,
+    tx: Sender<Msg>,
+}
+
+impl Follower {
+    pub fn start(pattern: String) -> Follower {
+        let gain = Gain::new(1.0);
+        let (tx, rx) = mpsc::channel();
+        {
+            let (pattern, gain, tx) = (pattern.clone(), gain.clone(), tx.clone());
+            std::thread::spawn(move || unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                let devices_tx = tx.clone();
+                let _devices = DeviceWatch::new(move || {
+                    let _ = devices_tx.send(Msg::Devices);
+                })
+                .inspect_err(|e| {
+                    warn!(
+                        error = %e,
+                        "volume follow: can't watch for device changes; if the device goes \
+                         away, the volume stops following it until a restart"
+                    )
+                })
+                .ok();
+                run(&pattern, &gain, &tx, &rx);
+            });
+        }
+        Follower { pattern, gain, tx }
+    }
+
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    pub fn gain(&self) -> Gain {
+        self.gain.clone()
     }
 }
 
-/// Background thread: reads the volume every 30 ms and writes it to `gain`.
-/// The thread exits once `stop` is set.
-pub fn spawn_watcher(pattern: String, gain: Gain, stop: Arc<AtomicBool>) {
-    std::thread::spawn(move || unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let mut endpoint: Option<IAudioEndpointVolume> = None;
-        let mut warned = false;
+impl Drop for Follower {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::Stop);
+    }
+}
 
-        while !stop.load(Ordering::Relaxed) {
-            if endpoint.is_none() {
-                match find_endpoint(&pattern) {
-                    Ok(Some(ep)) => {
-                        info!(device = %pattern, "volume follow: device found");
-                        endpoint = Some(ep);
-                        warned = false;
-                    }
-                    _ => {
-                        if !warned {
-                            warn!(
-                                device = %pattern,
-                                "volume follow: playback device not found, using 100% for now"
-                            );
-                            warned = true;
-                        }
-                        gain.set(1.0);
-                        std::thread::sleep(Duration::from_secs(2));
-                        continue;
-                    }
-                }
-            }
+/// A device whose volume changes are being reported
+struct Followed {
+    id: String,
+    endpoint: IAudioEndpointVolume,
+    callback: IAudioEndpointVolumeCallback,
+}
 
-            let ep = endpoint.as_ref().unwrap();
-            let muted = ep.GetMute().map(|b| b.as_bool());
-            let scalar = ep.GetMasterVolumeLevelScalar();
-            let db = ep.GetMasterVolumeLevel();
-            match (muted, scalar, db) {
-                (Ok(m), Ok(s), Ok(db)) => {
-                    // Use the Windows dB curve so it feels the same as a regular speaker
-                    let g = if m || s <= 0.0 {
-                        0.0
-                    } else {
-                        10f32.powf(db / 20.0)
-                    };
-                    gain.set(g);
-                }
-                _ => {
-                    // The device may have been unplugged; look it up again next round
-                    endpoint = None;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(30));
+impl Drop for Followed {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.endpoint.UnregisterControlChangeNotify(&self.callback);
         }
-    });
+    }
+}
+
+#[implement(IAudioEndpointVolumeCallback)]
+struct Callback(Sender<Msg>);
+
+impl IAudioEndpointVolumeCallback_Impl for Callback_Impl {
+    fn OnNotify(&self, _: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows::core::Result<()> {
+        // Read on the follower thread: the notification has the slider position but not the
+        // dB level that is applied
+        let _ = self.0.send(Msg::Volume);
+        Ok(())
+    }
+}
+
+/// Follower thread body: look the device up at the start and after every device change,
+/// and read the volume after every volume change
+unsafe fn run(pattern: &str, gain: &Gain, tx: &Sender<Msg>, rx: &Receiver<Msg>) {
+    let mut followed: Option<Followed> = None;
+    let mut first = true;
+    let mut lookup = true;
+    loop {
+        if lookup {
+            let dev = find_render_device(pattern).ok().flatten();
+            let id = dev.as_ref().and_then(|d| device_id(d).ok());
+            // Only a different device (or none) is news; most device changes are elsewhere
+            if first || id.as_deref() != followed.as_ref().map(|f| f.id.as_str()) {
+                // Unregister the old one before registering again
+                followed = None;
+                match dev.zip(id) {
+                    Some((dev, id)) => match follow(&dev, id, tx) {
+                        Ok(f) => {
+                            info!(device = %pattern, "volume follow: device found");
+                            followed = Some(f);
+                        }
+                        Err(e) => warn!(
+                            device = %pattern,
+                            error = %e,
+                            "volume follow: can't read the device volume, using 100% for now"
+                        ),
+                    },
+                    None => warn!(
+                        device = %pattern,
+                        "volume follow: playback device not found, using 100% for now"
+                    ),
+                }
+            }
+            first = false;
+            lookup = false;
+        }
+
+        match followed.as_ref().map(|f| read_gain(&f.endpoint)) {
+            Some(Ok(g)) => gain.set(g),
+            Some(Err(e)) => {
+                // Probably being unplugged; the device change that follows looks it up again
+                debug!(error = %e, "volume follow: reading the volume failed");
+                followed = None;
+            }
+            None => gain.set(1.0),
+        }
+
+        match rx.recv() {
+            Ok(Msg::Volume) => {}
+            Ok(Msg::Devices) => lookup = true,
+            Ok(Msg::Stop) | Err(_) => break,
+        }
+    }
+}
+
+unsafe fn follow(dev: &IMMDevice, id: String, tx: &Sender<Msg>) -> windows::core::Result<Followed> {
+    let endpoint: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None)?;
+    let callback: IAudioEndpointVolumeCallback = Callback(tx.clone()).into();
+    endpoint.RegisterControlChangeNotify(&callback)?;
+    Ok(Followed {
+        id,
+        endpoint,
+        callback,
+    })
+}
+
+unsafe fn read_gain(ep: &IAudioEndpointVolume) -> windows::core::Result<f32> {
+    let muted = ep.GetMute()?.as_bool();
+    let scalar = ep.GetMasterVolumeLevelScalar()?;
+    let db = ep.GetMasterVolumeLevel()?;
+    // Use the Windows dB curve so it feels the same as a regular speaker
+    Ok(if muted || scalar <= 0.0 {
+        0.0
+    } else {
+        10f32.powf(db / 20.0)
+    })
 }

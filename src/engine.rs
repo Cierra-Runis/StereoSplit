@@ -62,6 +62,10 @@ fn on_stream_error(stream: &'static str, on_error: OnError) -> impl FnMut(cpal::
     move |e| match e.kind() {
         // Some audio was dropped (e.g. after a brief system stall), but the stream goes on
         ErrorKind::Xrun => debug!(stream, "buffer overrun or underrun"),
+        ErrorKind::DeviceNotAvailable => {
+            warn!(stream, "device disconnected");
+            on_error(stream);
+        }
         _ => {
             error!(stream, error = %e, "stream error");
             on_error(stream);
@@ -444,15 +448,7 @@ impl Engine {
             gain.clone(),
             on_error.clone(),
         )?;
-        let right = build_output(
-            &right_dev,
-            "right",
-            sample_rate,
-            rc,
-            target,
-            gain,
-            on_error,
-        )?;
+        let right = build_output(&right_dev, "right", sample_rate, rc, target, gain, on_error)?;
         input
             .play()
             .map_err(|e| anyhow!("Failed to start capturing sound: {e}"))?;

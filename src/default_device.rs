@@ -99,7 +99,7 @@ fn restore_file() -> std::path::PathBuf {
     config::data_dir().join(config::RESTORE_FILE)
 }
 
-fn com_init() {
+pub fn com_init() {
     // Fails harmlessly if COM is already initialized on this thread in another mode
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -152,7 +152,7 @@ pub unsafe fn find_render_device(pattern: &str) -> windows::core::Result<Option<
     Ok(engine::pick(&names, pattern).map(|i| devs.swap_remove(i).1))
 }
 
-unsafe fn device_id(dev: &IMMDevice) -> Result<String> {
+pub unsafe fn device_id(dev: &IMMDevice) -> Result<String> {
     let p = dev.GetId()?;
     let s = p.to_string();
     CoTaskMemFree(Some(p.0 as *const _));

@@ -3,19 +3,19 @@
 
 mod config;
 mod default_device;
+mod device_watch;
 mod engine;
 mod logging;
 mod toast;
 mod volume;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use config::Config;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tray_icon::menu::{
     CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
@@ -41,6 +41,13 @@ const APP_NAME: &str = env!("APP_NAME");
 const ICON_RESOURCE: &str = env!("ICON_RESOURCE");
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const LATENCIES: [u32; 4] = [15, 20, 30, 50];
+/// How long to wait before retrying a failed start when no device change comes first.
+/// Device changes retry right away; this covers failures they don't announce, such as a
+/// speaker held by another app in exclusive mode.
+const RETRY_FALLBACK: Duration = Duration::from_secs(30);
+/// Quiet time that ends a burst of config saves or of device changes (see `debounce`)
+const CONFIG_QUIET: Duration = Duration::from_millis(150);
+const DEVICES_QUIET: Duration = Duration::from_millis(500);
 
 fn autostart_enabled() -> bool {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -83,6 +90,8 @@ enum Event {
     },
     /// config.toml was saved, from the tray menu or by hand
     ConfigChanged,
+    /// An audio device was plugged in, unplugged, enabled or disabled
+    DevicesChanged,
 }
 
 /// Report saves of config.toml. The folder is watched rather than the file, since some
@@ -118,11 +127,12 @@ fn watch_config(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
     }
 }
 
-/// Let a save settle: one save often arrives as several events (e.g. truncate, then write).
+/// Let a change settle until nothing arrives for `quiet`: one save often arrives as several
+/// events (e.g. truncate, then write), and so does plugging in a device.
 /// Returns false on quit.
-fn debounce(rx: &Receiver<Event>) -> bool {
+fn debounce(rx: &Receiver<Event>, quiet: Duration) -> bool {
     loop {
-        match rx.recv_timeout(Duration::from_millis(150)) {
+        match rx.recv_timeout(quiet) {
             Ok(Event::Quit) | Err(RecvTimeoutError::Disconnected) => return false,
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => return true,
@@ -130,10 +140,11 @@ fn debounce(rx: &Receiver<Event>) -> bool {
     }
 }
 
-/// Wait for the config to change, or for `timeout` to pass. Returns false on quit.
+/// Wait for the config to change. With `retry`, also stop waiting when a device changes or
+/// after the time given, whichever comes first. Returns false on quit.
 /// Failures still queued from an engine that is already gone are skipped here.
-fn wait(rx: &Receiver<Event>, timeout: Option<Duration>) -> bool {
-    let deadline = timeout.map(|t| Instant::now() + t);
+fn wait(rx: &Receiver<Event>, retry: Option<Duration>) -> bool {
+    let deadline = retry.map(|t| Instant::now() + t);
     loop {
         let ev = match deadline {
             Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
@@ -148,8 +159,9 @@ fn wait(rx: &Receiver<Event>, timeout: Option<Duration>) -> bool {
         };
         match ev {
             Event::Quit => return false,
-            Event::ConfigChanged => return debounce(rx),
-            Event::Failed { .. } => {}
+            Event::ConfigChanged => return debounce(rx, CONFIG_QUIET),
+            Event::DevicesChanged if retry.is_some() => return debounce(rx, DEVICES_QUIET),
+            Event::DevicesChanged | Event::Failed { .. } => {}
         }
     }
 }
@@ -161,11 +173,31 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
     std::thread::spawn(move || {
         let set_status = |s: &str| *status.lock().unwrap() = s.into();
         let mut shown_error: Option<String> = None;
+        // Last start error written to the log, so retries that fail the same way don't
+        // repeat it
+        let mut logged_error: Option<String> = None;
         let mut hinted = false;
         // Whether this process has made the source the default playback device
         let mut managed = false;
 
         let _watcher = watch_config(tx.clone());
+        default_device::com_init();
+        let devices_tx = tx.clone();
+        let _devices = unsafe {
+            device_watch::DeviceWatch::new(move || {
+                let _ = devices_tx.send(Event::DevicesChanged);
+            })
+        }
+        .inspect_err(|e| {
+            warn!(
+                error = %e,
+                retry_in_secs = RETRY_FALLBACK.as_secs(),
+                "can't watch for device changes; reconnecting only retries on a timer"
+            )
+        })
+        .ok();
+        // Follows the volume of `volume_endpoint`; replaced only when that setting changes
+        let mut volume: Option<volume::Follower> = None;
         // Counts engine starts, so failures from an earlier engine can be told apart
         let mut generation = 0u64;
         // The config whose engine was running until the audio was interrupted (e.g. a speaker
@@ -207,9 +239,12 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                 continue;
             }
 
-            let vol_stop = Arc::new(AtomicBool::new(false));
-            let gain = volume::Gain::new(1.0);
-            volume::spawn_watcher(cfg.volume_endpoint.clone(), gain.clone(), vol_stop.clone());
+            let gain = match &volume {
+                Some(v) if v.pattern() == cfg.volume_endpoint => v.gain(),
+                _ => volume
+                    .insert(volume::Follower::start(cfg.volume_endpoint.clone()))
+                    .gain(),
+            };
 
             generation += 1;
             let on_error: engine::OnError = {
@@ -223,6 +258,7 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
             let go_on = match engine::Engine::start(&cfg, gain, on_error) {
                 Ok(engine) => {
                     shown_error = None;
+                    logged_error = None;
                     interrupted = None;
                     set_status("Running");
                     match default_device::take_over(&cfg) {
@@ -236,6 +272,8 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                         match rx.recv() {
                             // From an engine that was already stopped
                             Ok(Event::Failed { generation: g, .. }) if g != generation => {}
+                            // A running engine hears about its own devices going away
+                            Ok(Event::DevicesChanged) => {}
                             Ok(ev) => break ev,
                             Err(_) => break Event::Quit,
                         }
@@ -244,7 +282,8 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                     drop(engine);
                     match ev {
                         Event::Quit => false,
-                        Event::ConfigChanged => debounce(&rx),
+                        Event::ConfigChanged => debounce(&rx, CONFIG_QUIET),
+                        Event::DevicesChanged => unreachable!("skipped above"),
                         Event::Failed { stream, .. } => {
                             warn!(stream, retry_in_secs = 2, "audio interrupted, reconnecting");
                             set_status("Reconnecting");
@@ -267,7 +306,12 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    error!(error = %msg, retry_in_secs = 3, "failed to start the engine");
+                    if logged_error.as_deref() != Some(msg.as_str()) {
+                        error!(error = %msg, "failed to start the engine");
+                        logged_error = Some(msg.clone());
+                    } else {
+                        debug!(error = %msg, "failed to start the engine again");
+                    }
                     // Once the config is changed, a failure is a failure to start again
                     let reconnecting = interrupted.as_ref() == Some(&cfg);
                     set_status(if reconnecting {
@@ -284,14 +328,15 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                     if !reconnecting && shown_error.as_deref() != Some(msg.as_str()) {
                         toast::show(
                             "Failed to start",
-                            &format!("{msg}\n\nRetrying automatically every 3 seconds."),
+                            &format!(
+                                "{msg}\n\nRetrying automatically when a device is plugged in."
+                            ),
                         );
                         shown_error = Some(msg);
                     }
-                    wait(&rx, Some(Duration::from_secs(3)))
+                    wait(&rx, Some(RETRY_FALLBACK))
                 }
             };
-            vol_stop.store(true, Ordering::Relaxed);
             if !go_on {
                 break;
             }
