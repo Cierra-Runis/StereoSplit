@@ -159,11 +159,6 @@ fn spawn_supervisor(quit: Arc<AtomicBool>, status: Arc<Mutex<String>>) {
                 }
             };
 
-            // Hand the default device back when management was just switched off
-            if managed && !cfg.manage_default_device {
-                release(&cfg, &mut managed);
-            }
-
             if cfg.left.is_empty() || cfg.right.is_empty() {
                 release(&cfg, &mut managed);
                 set_status("Choose speakers");
@@ -188,11 +183,9 @@ fn spawn_supervisor(quit: Arc<AtomicBool>, status: Arc<Mutex<String>>) {
                 Ok(engine) => {
                     shown_error = None;
                     set_status("Running");
-                    if cfg.manage_default_device {
-                        match default_device::take_over(&cfg) {
-                            Ok(()) => managed = true,
-                            Err(e) => log(&format!("{e:#}")),
-                        }
+                    match default_device::take_over(&cfg) {
+                        Ok(()) => managed = true,
+                        Err(e) => log(&format!("{e:#}")),
                     }
                     while !quit.load(Ordering::Relaxed)
                         && config::modified() == stamp
@@ -300,7 +293,6 @@ struct Tray {
     test_right: MenuItem,
     latency: Vec<(u32, CheckMenuItem)>,
     follow: CheckMenuItem,
-    manage: CheckMenuItem,
     auto: CheckMenuItem,
     open_config: MenuItem,
     view_log: MenuItem,
@@ -338,7 +330,6 @@ impl Tray {
             test_right: MenuItem::new("Test right", true, None),
             latency,
             follow: CheckMenuItem::new("Follow Windows volume keys", true, false, None),
-            manage: CheckMenuItem::new("Manage default playback device", true, false, None),
             auto: CheckMenuItem::new("Start with Windows", true, autostart_enabled(), None),
             open_config: MenuItem::new("Open config file", true, None),
             view_log: MenuItem::new("View log", true, None),
@@ -355,7 +346,6 @@ impl Tray {
             &PredefinedMenuItem::separator(),
             &latency_menu,
             &tray.follow,
-            &tray.manage,
             &tray.auto,
             &PredefinedMenuItem::separator(),
             &tray.open_config,
@@ -427,7 +417,6 @@ impl Tray {
         for (ms, item) in &self.latency {
             item.set_checked(*ms == cfg.latency_ms);
         }
-        self.manage.set_checked(cfg.manage_default_device);
     }
 
     fn handle(&mut self, id: &MenuId) {
@@ -449,8 +438,6 @@ impl Tray {
             edit_config(|c| c.latency_ms = ms)
         } else if id == self.swap.id() {
             edit_config(|c| std::mem::swap(&mut c.left, &mut c.right))
-        } else if id == self.manage.id() {
-            edit_config(|c| c.manage_default_device = !c.manage_default_device)
         } else if id == self.test_left.id() || id == self.test_right.id() {
             if let Ok(cfg) = config::load() {
                 let side = if id == self.test_left.id() {

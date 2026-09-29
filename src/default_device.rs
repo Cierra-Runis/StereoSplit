@@ -42,11 +42,19 @@ mod policy {
     pub unsafe trait IPolicyConfig: IUnknown {
         // Only SetDefaultEndpoint is called; the others just fill the vtable in the right order
         fn GetMixFormat(&self, device: PCWSTR, format: *mut *mut c_void) -> HRESULT;
-        fn GetDeviceFormat(&self, device: PCWSTR, default: i32, format: *mut *mut c_void)
-            -> HRESULT;
+        fn GetDeviceFormat(
+            &self,
+            device: PCWSTR,
+            default: i32,
+            format: *mut *mut c_void,
+        ) -> HRESULT;
         fn ResetDeviceFormat(&self, device: PCWSTR) -> HRESULT;
-        fn SetDeviceFormat(&self, device: PCWSTR, endpoint: *mut c_void, mix: *mut c_void)
-            -> HRESULT;
+        fn SetDeviceFormat(
+            &self,
+            device: PCWSTR,
+            endpoint: *mut c_void,
+            mix: *mut c_void,
+        ) -> HRESULT;
         fn GetProcessingPeriod(
             &self,
             device: PCWSTR,
@@ -57,10 +65,18 @@ mod policy {
         fn SetProcessingPeriod(&self, device: PCWSTR, period: *mut i64) -> HRESULT;
         fn GetShareMode(&self, device: PCWSTR, mode: *mut c_void) -> HRESULT;
         fn SetShareMode(&self, device: PCWSTR, mode: *mut c_void) -> HRESULT;
-        fn GetPropertyValue(&self, device: PCWSTR, key: *const c_void, value: *mut c_void)
-            -> HRESULT;
-        fn SetPropertyValue(&self, device: PCWSTR, key: *const c_void, value: *mut c_void)
-            -> HRESULT;
+        fn GetPropertyValue(
+            &self,
+            device: PCWSTR,
+            key: *const c_void,
+            value: *mut c_void,
+        ) -> HRESULT;
+        fn SetPropertyValue(
+            &self,
+            device: PCWSTR,
+            key: *const c_void,
+            value: *mut c_void,
+        ) -> HRESULT;
         fn SetDefaultEndpoint(&self, device: PCWSTR, role: ERole) -> HRESULT;
         fn SetEndpointVisibility(&self, device: PCWSTR, visible: i32) -> HRESULT;
     }
@@ -232,10 +248,8 @@ pub fn restore_from_disk() {
     let Ok(cfg) = config::load() else {
         return;
     };
-    if cfg.manage_default_device {
-        if let Err(e) = restore(&cfg) {
-            log(&format!("{e:#}"));
-        }
+    if let Err(e) = restore(&cfg) {
+        log(&format!("{e:#}"));
     }
 }
 

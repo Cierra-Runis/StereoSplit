@@ -6,32 +6,23 @@ use std::time::SystemTime;
 /// Config file contents. Device names are matched by case-insensitive substring,
 /// so part of the name is enough.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// Speaker for the left channel (empty until chosen in the tray menu)
-    #[serde(default)]
     pub left: String,
 
     /// Speaker for the right channel (empty until chosen in the tray menu)
-    #[serde(default)]
     pub right: String,
 
     /// Buffer latency in milliseconds. Raise it if you hear crackling, lower it for less delay.
-    #[serde(default = "default_latency")]
     pub latency_ms: u32,
-
-    /// Whether to make the source the default playback device while running, and switch back
-    /// to a speaker on exit
-    #[serde(default = "default_true")]
-    pub manage_default_device: bool,
 
     /// Where to capture sound from. A playback device (e.g. "CABLE Input") is captured via
     /// loopback, which does not trigger the microphone indicator; a recording device
     /// (e.g. the older default "CABLE Output") is also accepted.
-    #[serde(default = "default_source")]
     pub source: String,
 
     /// Which playback device's Windows volume to follow (VB-CABLE's playback side is "CABLE Input")
-    #[serde(default = "default_volume_endpoint")]
     pub volume_endpoint: String,
 }
 
@@ -40,25 +31,11 @@ impl Default for Config {
         Config {
             left: String::new(),
             right: String::new(),
-            latency_ms: default_latency(),
-            manage_default_device: true,
-            source: default_source(),
-            volume_endpoint: default_volume_endpoint(),
+            latency_ms: 20,
+            source: "CABLE Input".into(),
+            volume_endpoint: "CABLE Input".into(),
         }
     }
-}
-
-fn default_source() -> String {
-    "CABLE Input".into()
-}
-fn default_volume_endpoint() -> String {
-    "CABLE Input".into()
-}
-fn default_latency() -> u32 {
-    20
-}
-fn default_true() -> bool {
-    true
 }
 
 /// Config file text, with a comment above every setting for anyone editing it by hand
@@ -81,10 +58,6 @@ right = {right}
 # try 15 for less delay.
 latency_ms = {latency}
 
-# Make the source below the default playback device while running, and switch back to a
-# speaker on exit
-manage_default_device = {manage}
-
 # Where to capture sound from: VB-CABLE's playback side (reads what it is playing directly,
 # without opening any recording device)
 source = {source}
@@ -95,7 +68,6 @@ volume_endpoint = {volume}
         left = q(&cfg.left),
         right = q(&cfg.right),
         latency = cfg.latency_ms,
-        manage = cfg.manage_default_device,
         source = q(&cfg.source),
         volume = q(&cfg.volume_endpoint),
     )
@@ -148,7 +120,6 @@ mod tests {
             left: r#"Speakers "L" (USB\Audio)"#.into(),
             right: "Speaker-Right".into(),
             latency_ms: 35,
-            manage_default_device: false,
             source: "CABLE Input".into(),
             volume_endpoint: "CABLE In".into(),
         };
