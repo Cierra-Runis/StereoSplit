@@ -5,6 +5,7 @@ mod config;
 mod default_device;
 mod engine;
 mod logging;
+mod toast;
 mod volume;
 
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use tray_icon::menu::{
     CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
 };
@@ -30,26 +31,16 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MessageBoxW, PostQuitMessage,
-    RegisterClassW, TranslateMessage, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics,
+    PostQuitMessage, RegisterClassW, TranslateMessage, MSG, SM_CXSMICON, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
 };
 
-const APP_NAME: &str = "Stereo Split";
+/// Both defined in build.rs, which also writes them into the exe's resources
+const APP_NAME: &str = env!("APP_NAME");
+const ICON_RESOURCE: &str = env!("ICON_RESOURCE");
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const LATENCIES: [u32; 4] = [15, 20, 30, 50];
-
-fn message_box(text: &str, error: bool) {
-    let flags = MB_OK
-        | if error {
-            MB_ICONERROR
-        } else {
-            MB_ICONINFORMATION
-        };
-    unsafe {
-        MessageBoxW(None, &HSTRING::from(text), &HSTRING::from(APP_NAME), flags);
-    }
-}
 
 fn autostart_enabled() -> bool {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -71,44 +62,11 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
     }
 }
 
-/// Generated tray icon: left half blue, right half orange, for the left and right channels
-fn make_icon() -> Icon {
-    const N: u32 = 32;
-    const SS: u32 = 4;
-    const LEFT: [f32; 3] = [59.0, 130.0, 246.0];
-    const RIGHT: [f32; 3] = [245.0, 158.0, 11.0];
-    let (c, radius, half_gap) = (N as f32 / 2.0, 15.0f32, 1.0f32);
-    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
-    for y in 0..N {
-        for x in 0..N {
-            let (mut left, mut right) = (0u32, 0u32);
-            for sy in 0..SS {
-                for sx in 0..SS {
-                    let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
-                    let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
-                    let (dx, dy) = (px - c, py - c);
-                    if dx * dx + dy * dy > radius * radius {
-                        continue;
-                    }
-                    if dx < -half_gap {
-                        left += 1;
-                    } else if dx > half_gap {
-                        right += 1;
-                    }
-                }
-            }
-            let covered = left + right;
-            if covered == 0 {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-                continue;
-            }
-            let (wl, wr) = (left as f32 / covered as f32, right as f32 / covered as f32);
-            let mix = |i: usize| (LEFT[i] * wl + RIGHT[i] * wr).round() as u8;
-            let a = (covered as f32 * 255.0 / (SS * SS) as f32).round() as u8;
-            rgba.extend_from_slice(&[mix(0), mix(1), mix(2), a]);
-        }
-    }
-    Icon::from_rgba(rgba, N, N).expect("icon")
+/// Tray icon (left half blue, right half orange, for the left and right channels), embedded
+/// by build.rs from assets/icon/icon.ico at the size the tray uses on this screen
+fn tray_icon() -> Icon {
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) } as u32;
+    Icon::from_resource_name(ICON_RESOURCE, Some((size, size))).expect("icon resource")
 }
 
 /// What the supervisor thread waits for
@@ -214,7 +172,7 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                     error!(error = %msg, "failed to load the config");
                     set_status("Config error");
                     if shown_error.as_deref() != Some(msg.as_str()) {
-                        message_box(&msg, true);
+                        toast::show("Config error", &msg);
                         shown_error = Some(msg);
                     }
                     if !wait(&rx, None) {
@@ -229,10 +187,10 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                 set_status("Choose speakers");
                 if !hinted {
                     hinted = true;
-                    message_box(
+                    toast::show(
+                        "Choose speakers",
                         "Right-click the tray icon (the blue and orange dot) and choose your \
                          speakers under \"Left speaker\" and \"Right speaker\".",
-                        false,
                     );
                 }
                 if !wait(&rx, None) {
@@ -280,11 +238,9 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                     // Show each distinct error only once, then retry silently
                     // (e.g. a speaker that isn't plugged in yet)
                     if shown_error.as_deref() != Some(msg.as_str()) {
-                        message_box(
-                            &format!(
-                                "{msg}\n\nThe program will retry automatically every 3 seconds."
-                            ),
-                            true,
+                        toast::show(
+                            "Failed to start",
+                            &format!("{msg}\n\nRetrying automatically every 3 seconds."),
                         );
                         shown_error = Some(msg);
                     }
@@ -317,14 +273,14 @@ fn edit_config(f: impl FnOnce(&mut Config)) -> Option<Config> {
         Ok(mut cfg) => {
             f(&mut cfg);
             if let Err(e) = config::save(&cfg) {
-                message_box(&format!("{e:#}"), true);
+                toast::show("Failed to save the config", &format!("{e:#}"));
             }
             Some(cfg)
         }
         Err(e) => {
-            message_box(
+            toast::show(
+                "Config error",
                 &format!("{e:#}\n\nFix config.toml (or delete it to start over) first."),
-                true,
             );
             None
         }
@@ -522,9 +478,9 @@ impl Tray {
         } else if id == self.auto.id() {
             let want = self.auto.is_checked();
             if let Err(e) = set_autostart(want) {
-                message_box(
-                    &format!("Failed to enable/disable start with Windows: {e}"),
-                    true,
+                toast::show(
+                    "Failed to enable/disable start with Windows",
+                    &e.to_string(),
                 );
                 self.auto.set_checked(!want);
             }
@@ -630,9 +586,9 @@ fn main() {
     }
 
     if already_running() {
-        message_box(
+        toast::show(
+            "Already running",
             "Stereo Split is already running (see the system tray).",
-            false,
         );
         return;
     }
@@ -664,12 +620,12 @@ fn main() {
     let _tray_icon = match TrayIconBuilder::new()
         .with_menu(Box::new(tray.menu.clone()))
         .with_tooltip(APP_NAME)
-        .with_icon(make_icon())
+        .with_icon(tray_icon())
         .build()
     {
         Ok(t) => t,
         Err(e) => {
-            message_box(&format!("Failed to create tray icon: {e}"), true);
+            toast::show("Failed to create the tray icon", &e.to_string());
             return;
         }
     };

@@ -1,0 +1,4 @@
+# Link the C runtime into the exe, so it runs on PCs without the Visual C++ Redistributable
+# TIPS: a RUSTFLAGS environment variable replaces these flags entirely.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
