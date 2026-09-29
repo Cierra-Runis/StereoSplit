@@ -1,11 +1,13 @@
 // Don't open a black console window in release builds
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod config;
 mod default_device;
 mod devices;
 mod engine;
 mod logging;
+mod session;
 mod supervisor;
 mod toast;
 mod volume;
@@ -21,47 +23,20 @@ use tray_icon::menu::{
     CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{
-    GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::core::PCWSTR;
 use windows::Win32::System::Recovery::{RegisterApplicationRestart, RESTART_NO_REBOOT};
-use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics,
-    PostQuitMessage, RegisterClassW, TranslateMessage, MSG, SM_CXSMICON, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
+    DispatchMessageW, GetMessageW, GetSystemMetrics, PostQuitMessage, TranslateMessage, MSG,
+    SM_CXSMICON,
 };
 
 /// Both defined in build.rs, which also writes them into the exe's resources
 const APP_NAME: &str = env!("APP_NAME");
 const ICON_RESOURCE: &str = env!("ICON_RESOURCE");
-const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const LATENCIES: [u32; 4] = [15, 20, 30, 50];
-
-fn autostart_enabled() -> bool {
-    use winreg::enums::HKEY_CURRENT_USER;
-    winreg::RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(RUN_KEY)
-        .and_then(|k| k.get_value::<String, _>(APP_NAME))
-        .is_ok()
-}
-
-fn set_autostart(on: bool) -> std::io::Result<()> {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
-    let key =
-        winreg::RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)?;
-    if on {
-        let exe = std::env::current_exe()?;
-        key.set_value(APP_NAME, &format!("\"{}\"", exe.display()))
-    } else {
-        key.delete_value(APP_NAME)
-    }
-}
 
 /// Tray icon (left half blue, right half orange, for the left and right channels), embedded
 /// by build.rs from assets/icon/icon.ico at the size the tray uses on this screen
@@ -163,7 +138,7 @@ impl Tray {
             ],
             swap: MenuItem::new("Swap left / right", true, None),
             latency,
-            auto: CheckMenuItem::new("Start with Windows", true, autostart_enabled(), None),
+            auto: CheckMenuItem::new("Start with Windows", true, autostart::enabled(), None),
             open_config: MenuItem::new("Open config file", true, None),
             view_log: MenuItem::new("Open log folder", true, None),
             quit: MenuItem::new("Exit", true, None),
@@ -274,7 +249,7 @@ impl Tray {
             None
         } else if id == self.auto.id() {
             let want = self.auto.is_checked();
-            if let Err(e) = set_autostart(want) {
+            if let Err(e) = autostart::set(want) {
                 toast::show(
                     "Failed to enable/disable start with Windows",
                     &e.to_string(),
@@ -304,69 +279,6 @@ impl Tray {
     }
 }
 
-/// True if another copy of the program is already running
-fn already_running() -> bool {
-    unsafe {
-        // The handle is deliberately kept open for the lifetime of the process
-        CreateMutexW(None, false, w!("Local\\StereoSplit")).is_ok()
-            && GetLastError() == ERROR_ALREADY_EXISTS
-    }
-}
-
-unsafe extern "system" fn session_wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_QUERYENDSESSION => LRESULT(1),
-        WM_ENDSESSION => {
-            if wparam.0 != 0 {
-                info!("windows is logging off or shutting down");
-                default_device::restore_from_disk();
-            }
-            LRESULT(0)
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-/// Hidden top-level window whose only job is to hear about logoff/shutdown
-/// (message-only windows don't receive those broadcasts)
-fn create_session_window() {
-    unsafe {
-        let Ok(module) = GetModuleHandleW(None) else {
-            return;
-        };
-        let class = w!("StereoSplitSession");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(session_wndproc),
-            hInstance: module.into(),
-            lpszClassName: class,
-            ..Default::default()
-        };
-        RegisterClassW(&wc);
-        let created = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            class,
-            PCWSTR::null(),
-            WINDOW_STYLE(0),
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            module,
-            None,
-        );
-        if let Err(e) = created {
-            error!(error = %e, "failed to create the session window");
-        }
-    }
-}
-
 fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -382,7 +294,7 @@ fn main() {
         return;
     }
 
-    if already_running() {
+    if session::already_running() {
         toast::show(
             "Already running",
             "Stereo Split is already running (see the system tray).",
@@ -405,7 +317,7 @@ fn main() {
         let _ = RegisterApplicationRestart(PCWSTR::null(), RESTART_NO_REBOOT);
     }
     default_device::spawn_guard(log_file.as_deref());
-    create_session_window();
+    session::create_window();
 
     let (tx, rx) = mpsc::channel();
     let status = Arc::new(Mutex::new("Starting"));

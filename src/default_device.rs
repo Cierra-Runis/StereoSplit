@@ -157,8 +157,17 @@ pub fn take_over(cfg: &Config) -> Result<()> {
 }
 
 /// If the source is still the default playback device, switch back to the device that was
-/// the default before, or failing that to the left or right speaker.
-pub fn restore(cfg: &Config) -> Result<()> {
+/// the default before, or failing that to the left or right speaker. Errors are only logged.
+pub fn restore(cfg: &Config) {
+    if let Err(e) = try_restore(cfg) {
+        error!(
+            error = %format_args!("{e:#}"),
+            "failed to switch the default playback device back"
+        );
+    }
+}
+
+fn try_restore(cfg: &Config) -> Result<()> {
     com_init();
     unsafe {
         let Some(cable) = cable_id(cfg) else {
@@ -186,16 +195,10 @@ pub fn restore(cfg: &Config) -> Result<()> {
 }
 
 /// Restore using the config on disk. Used on exit, from the panic hook and from the guard,
-/// where no config is at hand. Errors are only logged.
+/// where no config is at hand.
 pub fn restore_from_disk() {
-    let Ok(cfg) = config::load() else {
-        return;
-    };
-    if let Err(e) = restore(&cfg) {
-        error!(
-            error = %format_args!("{e:#}"),
-            "failed to switch the default playback device back"
-        );
+    if let Ok(cfg) = config::load() {
+        restore(&cfg);
     }
 }
 

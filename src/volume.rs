@@ -122,39 +122,8 @@ impl IAudioEndpointVolumeCallback_Impl for Callback_Impl {
 /// Follower thread body: look the device up at the start and after every device change,
 /// and read the volume after every volume change
 unsafe fn run(pattern: &str, gain: &Gain, tx: &Sender<Msg>, rx: &Receiver<Msg>) {
-    let mut followed: Option<Followed> = None;
-    let mut first = true;
-    let mut lookup = true;
+    let mut followed = start(pattern, lookup(pattern), tx);
     loop {
-        if lookup {
-            let dev = find_render_device(pattern);
-            let id = dev.as_ref().and_then(|d| device_id(d));
-            // Only a different device (or none) is news; most device changes are elsewhere
-            if first || id.as_deref() != followed.as_ref().map(|f| f.id.as_str()) {
-                // Unregister the old one before registering again
-                followed = None;
-                match dev.zip(id) {
-                    Some((dev, id)) => match follow(&dev, id, tx) {
-                        Ok(f) => {
-                            info!(device = %pattern, "volume follow: device found");
-                            followed = Some(f);
-                        }
-                        Err(e) => warn!(
-                            device = %pattern,
-                            error = %e,
-                            "volume follow: can't read the device volume, using 100% for now"
-                        ),
-                    },
-                    None => warn!(
-                        device = %pattern,
-                        "volume follow: playback device not found, using 100% for now"
-                    ),
-                }
-            }
-            first = false;
-            lookup = false;
-        }
-
         match followed.as_ref().map(|f| read_gain(&f.endpoint)) {
             Some(Ok(g)) => gain.set(g),
             Some(Err(e)) => {
@@ -167,10 +136,51 @@ unsafe fn run(pattern: &str, gain: &Gain, tx: &Sender<Msg>, rx: &Receiver<Msg>) 
 
         match rx.recv() {
             Ok(Msg::Volume) => {}
-            Ok(Msg::Devices) => lookup = true,
+            Ok(Msg::Devices) => {
+                let found = lookup(pattern);
+                // Only a different device (or none) is news; most device changes are elsewhere
+                let found_id = found.as_ref().map(|(_, id)| id.as_str());
+                if found_id != followed.as_ref().map(|f| f.id.as_str()) {
+                    // Unregister the old one before registering again
+                    drop(followed.take());
+                    followed = start(pattern, found, tx);
+                }
+            }
             Ok(Msg::Stop) | Err(_) => break,
         }
     }
+}
+
+/// The playback device matching `pattern`, with its id
+unsafe fn lookup(pattern: &str) -> Option<(IMMDevice, String)> {
+    let dev = find_render_device(pattern)?;
+    let id = device_id(&dev)?;
+    Some((dev, id))
+}
+
+/// Follow `found` (from [`lookup`]), logging how that went
+unsafe fn start(
+    pattern: &str,
+    found: Option<(IMMDevice, String)>,
+    tx: &Sender<Msg>,
+) -> Option<Followed> {
+    let Some((dev, id)) = found else {
+        warn!(
+            device = %pattern,
+            "volume follow: playback device not found, using 100% for now"
+        );
+        return None;
+    };
+    follow(&dev, id, tx)
+        .inspect(|_| info!(device = %pattern, "volume follow: device found"))
+        .inspect_err(|e| {
+            warn!(
+                device = %pattern,
+                error = %e,
+                "volume follow: can't read the device volume, using 100% for now"
+            )
+        })
+        .ok()
 }
 
 unsafe fn follow(dev: &IMMDevice, id: String, tx: &Sender<Msg>) -> windows::core::Result<Followed> {

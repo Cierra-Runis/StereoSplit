@@ -291,12 +291,7 @@ impl Audio {
     /// Switch the default playback device back if this process took it over
     fn release(&mut self, cfg: &Config) {
         if std::mem::take(&mut self.managed) {
-            if let Err(e) = default_device::restore(cfg) {
-                error!(
-                    error = %format_args!("{e:#}"),
-                    "failed to switch the default playback device back"
-                );
-            }
+            default_device::restore(cfg);
         }
     }
 }
