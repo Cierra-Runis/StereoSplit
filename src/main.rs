@@ -23,6 +23,9 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Recovery::{RegisterApplicationRestart, RESTART_NO_REBOOT};
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MessageBoxW, PostQuitMessage,
     RegisterClassW, TranslateMessage, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG,
@@ -90,24 +93,42 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
 
 /// Generated tray icon: left half blue, right half orange, for the left and right channels
 fn make_icon() -> Icon {
-    let n = 32u32;
-    let mut rgba = Vec::with_capacity((n * n * 4) as usize);
-    for y in 0..n {
-        for x in 0..n {
-            let (dx, dy) = (x as f32 - 15.5, y as f32 - 15.5);
-            let inside = dx * dx + dy * dy <= 15.0 * 15.0;
-            let gap = (x == 15 || x == 16) && inside;
-            let (r, g, b, a) = if !inside || gap {
-                (0, 0, 0, 0)
-            } else if x < 16 {
-                (0x3b, 0x82, 0xf6, 255)
-            } else {
-                (0xf5, 0x9e, 0x0b, 255)
-            };
-            rgba.extend_from_slice(&[r, g, b, a]);
+    const N: u32 = 32;
+    const SS: u32 = 4;
+    const LEFT: [f32; 3] = [59.0, 130.0, 246.0];
+    const RIGHT: [f32; 3] = [245.0, 158.0, 11.0];
+    let (c, radius, half_gap) = (N as f32 / 2.0, 15.0f32, 1.0f32);
+    let mut rgba = Vec::with_capacity((N * N * 4) as usize);
+    for y in 0..N {
+        for x in 0..N {
+            let (mut left, mut right) = (0u32, 0u32);
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
+                    let (dx, dy) = (px - c, py - c);
+                    if dx * dx + dy * dy > radius * radius {
+                        continue;
+                    }
+                    if dx < -half_gap {
+                        left += 1;
+                    } else if dx > half_gap {
+                        right += 1;
+                    }
+                }
+            }
+            let covered = left + right;
+            if covered == 0 {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            let (wl, wr) = (left as f32 / covered as f32, right as f32 / covered as f32);
+            let mix = |i: usize| (LEFT[i] * wl + RIGHT[i] * wr).round() as u8;
+            let a = (covered as f32 * 255.0 / (SS * SS) as f32).round() as u8;
+            rgba.extend_from_slice(&[mix(0), mix(1), mix(2), a]);
         }
     }
-    Icon::from_rgba(rgba, n, n).expect("icon")
+    Icon::from_rgba(rgba, N, N).expect("icon")
 }
 
 /// Audio supervisor thread: starts the engine, retries automatically after errors (e.g. a
@@ -538,6 +559,10 @@ fn create_session_window() {
 }
 
 fn main() {
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--guard") {
         if let Some(pid) = args.get(2).and_then(|s| s.parse().ok()) {
