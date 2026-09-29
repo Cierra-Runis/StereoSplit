@@ -341,12 +341,13 @@ fn main() {
 
             while let Ok(ev) = menu_rx.try_recv() {
                 if tray.handle(&ev.id).is_break() {
-                    let _ = tx.send(supervisor::Event::Quit);
                     PostQuitMessage(0);
                 }
             }
         }
     }
+    // However the loop ended, stop the audio
+    let _ = tx.send(supervisor::Event::Quit);
     info!("program exited");
     // Give the audio threads a moment to wind down, then hand the default device back
     std::thread::sleep(Duration::from_millis(300));

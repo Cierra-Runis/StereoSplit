@@ -25,7 +25,7 @@ const DEVICES_QUIET: Duration = Duration::from_millis(500);
 
 /// What the supervisor thread waits for
 pub enum Event {
-    /// Exit was chosen from the tray menu
+    /// The program is exiting (Exit in the tray menu, Ctrl+C or the console closing)
     Quit,
     /// A running audio stream failed (e.g. a speaker was unplugged)
     Failed {
