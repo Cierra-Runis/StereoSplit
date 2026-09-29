@@ -7,8 +7,10 @@ Splits your PC's audio into its left and right channels and sends each one to a 
 1. Uses loopback capture to read what CABLE Input is playing. It never opens a recording device, so Windows won't show "microphone in use", and your microphone isn't affected.
 2. Sends the left channel to the left speaker and the right channel to the right speaker, fully separated with no bleed between them.
 3. Reads the volume and mute state you set for CABLE Input in Windows and applies them to both speakers in real time, so the keyboard volume keys and the taskbar volume slider work as usual.
-4. Corrects clock drift between the two speakers automatically, so left and right stay in sync even during long playback (to within about 1 ms).
-5. Reconnects automatically when a speaker is unplugged and plugged back in, lives in the system tray, and can start with Windows.
+4. Resamples for each speaker on its own, so the speakers and CABLE Input can use different sample rates.
+5. Corrects clock drift between the two speakers automatically by adjusting each speaker's playback speed very slightly, so left and right stay in sync even during long playback.
+6. Makes CABLE Input the default playback device while it runs, and switches back to your speaker when it exits. A small guard process does the same if the program crashes or is killed, so your PC is never left silent.
+7. Reconnects automatically when a speaker is unplugged and plugged back in, lives in the system tray, and can start with Windows.
 
 ## First-time setup
 
@@ -16,23 +18,23 @@ Splits your PC's audio into its left and right channels and sends each one to a 
 
 Download and install it from <https://vb-audio.com/Cable> (free donationware), then restart your PC.
 
-### 2. Adjust a few Windows settings
+### 2. Adjust a few Windows settings (optional)
 
 Open "Control Panel → Sound":
 
-- On the "Playback" tab, set **CABLE Input** as the default device.
-- Double-click each of the two speakers and, on the "General" tab, rename them to `Speaker-Left` and `Speaker-Right` (or any names you can easily tell apart).
+- Tip: double-click each of the two speakers and, on the "General" tab, rename them to `Speaker-Left` and `Speaker-Right` (or any names you can easily tell apart), so they're easy to pick in the tray menu.
 - Reset "Levels → Balance" on both speakers to equal left/right if you changed it before. This program splits the channels itself, so balance is no longer needed.
-- **Sample rates must match**: for both speakers and CABLE Input (all on the Playback tab), choose the same sample rate under "Properties → Advanced → Default Format". `48000 Hz` is recommended.
 - On the "Recording" tab, check that your microphone is still the default device (Windows sometimes makes CABLE Output the default when VB-CABLE is installed).
 
-### 3. Run the program
+You don't need to change the default playback device or match sample rates; the program takes care of both.
+
+### 3. Run the program and choose your speakers
 
 Put `stereo-split.exe` in a permanent folder (for example `D:\Tools\StereoSplit\`) and double-click it.
 
-On first run it creates `config.toml` in the same folder and shows a notice. Right-click the tray icon (a dot that's blue on the left and orange on the right) → "Open config file", change `left` and `right` to your speakers' names (part of the name is enough), save, then right-click → "Reload config".
+Right-click the tray icon (a dot that's blue on the left and orange on the right), pick your speakers under "Left speaker" and "Right speaker", then use "Test left" / "Test right" to check that each one beeps from the side you expect. If they're the wrong way round, choose "Swap left / right".
 
-`devices.txt` in the same folder lists the full names of every audio device on your PC, in case you're unsure.
+Every change takes effect immediately; there's nothing to save or reload.
 
 ### 4. Start with Windows
 
@@ -40,32 +42,37 @@ Right-click the tray icon and check "Start with Windows".
 
 ## Tray menu
 
-| Item               | What it does                                           |
-| ------------------ | ------------------------------------------------------ |
-| Status             | Shows Running, Reconnecting, Config error, etc.        |
-| Open config file   | Opens `config.toml` in Notepad                         |
-| Reload config      | Applies config changes immediately, no restart needed  |
-| View log           | Look here when something goes wrong                    |
-| Start with Windows | Adds or removes the startup entry for the current user |
-| Exit               | Exits the program                                      |
+| Item                           | What it does                                                                  |
+| ------------------------------ | ----------------------------------------------------------------------------- |
+| Status                         | Shows Running, Choose speakers, Reconnecting, Config error, etc.              |
+| Left speaker / Right speaker   | Pick the speaker for each channel. The list refreshes when you plug one in    |
+| Swap left / right              | Swaps the two speakers                                                        |
+| Test left / Test right         | Plays a short beep on that speaker                                            |
+| Latency                        | Buffer size. Raise it if you hear crackling, lower it for less delay          |
+| Follow Windows volume keys     | Whether the volume keys and taskbar slider control both speakers              |
+| Manage default playback device | Switch the default device to CABLE Input while running, and back on exit      |
+| Start with Windows             | Adds or removes the startup entry for the current user                        |
+| Open config file               | Opens `config.toml` in Notepad for the advanced settings. Saving applies them |
+| View log                       | Look here when something goes wrong                                           |
+| Exit                           | Exits the program and switches the default device back to your speaker        |
 
 ## Troubleshooting
 
-**No sound at all**: Make sure the default playback device is CABLE Input, then check "Status" in the tray menu and the log.
+**No sound at all**: Check "Status" in the tray menu and the log. If it says "Choose speakers", pick both speakers in the tray menu.
 
-**A popup says the sample rates don't match**: Set every device to the same sample rate as described in step 2 above.
+**Crackling or dropouts**: Set "Latency" in the tray menu to 50 ms.
 
-**Crackling or dropouts**: Raise `latency_ms` in `config.toml` to 50.
+**Left and right are swapped**: Choose "Swap left / right" in the tray menu.
 
-**Left and right are swapped**: Swap the values of `left` and `right` in the config.
+**Volume keys do nothing**: Make sure "Follow Windows volume keys" is checked and that `volume_endpoint` in `config.toml` matches CABLE Input.
 
-**Volume keys do nothing**: Make sure `follow_windows_volume = true` and that `volume_endpoint` matches CABLE Input.
-
-**Volume changes are too steep (one step drops it a lot)**: Windows is already applying the volume to the loopback audio, and the program applies it a second time. Set `follow_windows_volume` to `false`.
+**Volume changes are too steep (one step drops it a lot)**: Windows is already applying the volume to the loopback audio, and the program applies it a second time. Uncheck "Follow Windows volume keys".
 
 **The tray shows "microphone in use"**: Open `config.toml` and make sure `source = "CABLE Input"` (older versions defaulted to CABLE Output).
 
-**Going back to normal**: Exit the program and set the default playback device back to one of the speakers.
+**I want to pick the default playback device myself**: Uncheck "Manage default playback device". The program will then leave the default device alone, and you'll need to set CABLE Input as the default yourself.
+
+**Going back to normal**: Just exit the program; the default playback device switches back to the speaker you used before.
 
 ## Building from source
 

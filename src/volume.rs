@@ -5,21 +5,14 @@
 //! So this program reads that volume and applies it itself, which lets the keyboard volume
 //! keys control both speakers.
 
+use crate::default_device::find_render_device;
 use crate::log;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use windows::core::PWSTR;
-use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-use windows::Win32::Media::Audio::{
-    eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
-};
-use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
-};
+use windows::Win32::System::Com::{CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
 
 /// Shared gain value (the f32 bit pattern is stored in an AtomicU32)
 #[derive(Clone)]
@@ -37,39 +30,17 @@ impl Gain {
     }
 }
 
-unsafe fn friendly_name(dev: &IMMDevice) -> Option<String> {
-    let store = dev.OpenPropertyStore(STGM_READ).ok()?;
-    let pv = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
-    let p: PWSTR = PropVariantToStringAlloc(&pv).ok()?;
-    let s = p.to_string().ok();
-    CoTaskMemFree(Some(p.0 as *const _));
-    s
-}
-
 unsafe fn find_endpoint(pattern: &str) -> windows::core::Result<Option<IAudioEndpointVolume>> {
-    let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-    let coll = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-    let pat = pattern.to_lowercase();
-    for i in 0..coll.GetCount()? {
-        let dev = coll.Item(i)?;
-        if let Some(name) = friendly_name(&dev) {
-            if name.to_lowercase().contains(&pat) {
-                let vol: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None)?;
-                return Ok(Some(vol));
-            }
-        }
+    match find_render_device(pattern)? {
+        Some(dev) => Ok(Some(dev.Activate(CLSCTX_ALL, None)?)),
+        None => Ok(None),
     }
-    Ok(None)
 }
 
 /// Background thread: reads the volume every 30 ms and writes it to `gain`.
 /// When `enabled` is false the gain is fixed at 1. The thread exits once `stop` is set.
-pub fn spawn_watcher(pattern: String, enabled: bool, gain: Gain, stop: Arc<AtomicBool>) {
+pub fn spawn_watcher(pattern: String, gain: Gain, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || unsafe {
-        if !enabled {
-            gain.set(1.0);
-            return;
-        }
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let mut endpoint: Option<IAudioEndpointVolume> = None;
         let mut warned = false;

@@ -1,11 +1,29 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 /// Config file contents. Device names are matched by case-insensitive substring,
 /// so part of the name is enough.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
+    /// Speaker for the left channel (empty until chosen in the tray menu)
+    #[serde(default)]
+    pub left: String,
+
+    /// Speaker for the right channel (empty until chosen in the tray menu)
+    #[serde(default)]
+    pub right: String,
+
+    /// Buffer latency in milliseconds. Raise it if you hear crackling, lower it for less delay.
+    #[serde(default = "default_latency")]
+    pub latency_ms: u32,
+
+    /// Whether to make the source the default playback device while running, and switch back
+    /// to a speaker on exit
+    #[serde(default = "default_true")]
+    pub manage_default_device: bool,
+
     /// Where to capture sound from. A playback device (e.g. "CABLE Input") is captured via
     /// loopback, which does not trigger the microphone indicator; a recording device
     /// (e.g. the older default "CABLE Output") is also accepted.
@@ -15,20 +33,19 @@ pub struct Config {
     /// Which playback device's Windows volume to follow (VB-CABLE's playback side is "CABLE Input")
     #[serde(default = "default_volume_endpoint")]
     pub volume_endpoint: String,
+}
 
-    /// Speaker for the left channel
-    pub left: String,
-
-    /// Speaker for the right channel
-    pub right: String,
-
-    /// Buffer latency in milliseconds. Raise it if you hear crackling, lower it for less delay.
-    #[serde(default = "default_latency")]
-    pub latency_ms: u32,
-
-    /// Whether to follow the Windows volume keys
-    #[serde(default = "default_true")]
-    pub follow_windows_volume: bool,
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            left: String::new(),
+            right: String::new(),
+            latency_ms: default_latency(),
+            manage_default_device: true,
+            source: default_source(),
+            volume_endpoint: default_volume_endpoint(),
+        }
+    }
 }
 
 fn default_source() -> String {
@@ -44,34 +61,45 @@ fn default_true() -> bool {
     true
 }
 
-const TEMPLATE: &str = r#"# Stereo Split config file
+/// Config file text, with a comment above every setting for anyone editing it by hand
+fn render(cfg: &Config) -> String {
+    // Let toml do the quoting and escaping
+    let q = |s: &str| toml::Value::String(s.into()).to_string();
+    format!(
+        r#"# Stereo Split config file
+# Everything here can also be changed from the tray menu. Changes made in this file take
+# effect as soon as it is saved.
 # Device names are matched by case-insensitive substring, so part of the name is enough.
-# The full names of every device on this PC are listed in devices.txt in the same folder
-# (refreshed on every start).
-# After editing, right-click the tray icon and choose "Reload config" to apply.
 
-# Speaker for the left channel (tip: rename both speakers in the Windows sound settings
-# first so they are easy to tell apart)
-left = "Speaker-Left"
+# Speaker for the left channel
+left = {left}
 
 # Speaker for the right channel
-right = "Speaker-Right"
-
-# Where to capture sound from: VB-CABLE's playback side (reads what it is playing directly,
-# without opening any recording device)
-source = "CABLE Input"
-
-# Which device's Windows volume to follow: VB-CABLE's playback side (i.e. your default
-# playback device)
-volume_endpoint = "CABLE Input"
+right = {right}
 
 # Buffer latency in milliseconds. Raise to 50 if you hear crackling or dropouts;
 # try 15 for less delay.
-latency_ms = 20
+latency_ms = {latency}
 
-# Whether the keyboard volume keys control both speakers
-follow_windows_volume = true
-"#;
+# Make the source below the default playback device while running, and switch back to a
+# speaker on exit
+manage_default_device = {manage}
+
+# Where to capture sound from: VB-CABLE's playback side (reads what it is playing directly,
+# without opening any recording device)
+source = {source}
+
+# Which device's Windows volume to follow: VB-CABLE's playback side
+volume_endpoint = {volume}
+"#,
+        left = q(&cfg.left),
+        right = q(&cfg.right),
+        latency = cfg.latency_ms,
+        manage = cfg.manage_default_device,
+        source = q(&cfg.source),
+        volume = q(&cfg.volume_endpoint),
+    )
+}
 
 pub fn exe_dir() -> PathBuf {
     std::env::current_exe()
@@ -84,16 +112,53 @@ pub fn config_path() -> PathBuf {
     exe_dir().join("config.toml")
 }
 
-/// Load the config; if the file does not exist, write the template and return None.
-pub fn load() -> Result<Option<Config>> {
+/// Last modification time of the config file, used to pick up changes automatically
+pub fn modified() -> Option<SystemTime> {
+    std::fs::metadata(config_path())
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Load the config; if the file does not exist, write one with the defaults.
+pub fn load() -> Result<Config> {
     let path = config_path();
     if !path.exists() {
-        std::fs::write(&path, TEMPLATE)
-            .with_context(|| format!("Failed to create config file {}", path.display()))?;
-        return Ok(None);
+        let cfg = Config::default();
+        save(&cfg)?;
+        return Ok(cfg);
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read config file {}", path.display()))?;
-    let cfg: Config = toml::from_str(&text).context("Config file is malformed")?;
-    Ok(Some(cfg))
+    toml::from_str(&text).context("Config file is malformed")
+}
+
+pub fn save(cfg: &Config) -> Result<()> {
+    let path = config_path();
+    std::fs::write(&path, render(cfg))
+        .with_context(|| format!("Failed to write config file {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_round_trips() {
+        let cfg = Config {
+            left: r#"Speakers "L" (USB\Audio)"#.into(),
+            right: "Speaker-Right".into(),
+            latency_ms: 35,
+            manage_default_device: false,
+            source: "CABLE Input".into(),
+            volume_endpoint: "CABLE In".into(),
+        };
+        let parsed: Config = toml::from_str(&render(&cfg)).unwrap();
+        assert_eq!(parsed, cfg);
+    }
+
+    #[test]
+    fn missing_fields_use_defaults() {
+        let parsed: Config = toml::from_str("").unwrap();
+        assert_eq!(parsed, Config::default());
+    }
 }
