@@ -6,7 +6,7 @@
 
 use crate::config::{self, Config};
 use crate::engine::{self, Engine, StreamKind};
-use crate::{default_device, device_watch, toast, volume};
+use crate::{default_device, devices, toast, volume};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -173,10 +173,10 @@ impl State {
 pub fn spawn(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<&'static str>>) {
     std::thread::spawn(move || {
         let _watcher = watch_config(tx.clone());
-        default_device::com_init();
+        devices::com_init();
         let devices_tx = tx.clone();
         let _devices = unsafe {
-            device_watch::DeviceWatch::new(move || {
+            devices::DeviceWatch::new(move || {
                 let _ = devices_tx.send(Event::DevicesChanged);
             })
         }

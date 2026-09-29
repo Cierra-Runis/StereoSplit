@@ -5,8 +5,7 @@
 //! So this program reads that volume and applies it itself, which lets the keyboard volume
 //! keys control both speakers.
 
-use crate::default_device::{device_id, find_render_device};
-use crate::device_watch::DeviceWatch;
+use crate::devices::{device_id, find_render_device, DeviceWatch};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -128,8 +127,8 @@ unsafe fn run(pattern: &str, gain: &Gain, tx: &Sender<Msg>, rx: &Receiver<Msg>) 
     let mut lookup = true;
     loop {
         if lookup {
-            let dev = find_render_device(pattern).ok().flatten();
-            let id = dev.as_ref().and_then(|d| device_id(d).ok());
+            let dev = find_render_device(pattern);
+            let id = dev.as_ref().and_then(|d| device_id(d));
             // Only a different device (or none) is news; most device changes are elsewhere
             if first || id.as_deref() != followed.as_ref().map(|f| f.id.as_str()) {
                 // Unregister the old one before registering again

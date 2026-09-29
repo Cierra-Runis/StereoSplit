@@ -3,7 +3,7 @@
 
 mod config;
 mod default_device;
-mod device_watch;
+mod devices;
 mod engine;
 mod logging;
 mod supervisor;
@@ -97,7 +97,7 @@ fn choose(cfg: &mut Config, side: usize, name: &str, devices: &[String]) {
     } else {
         (&mut cfg.right, &mut cfg.left)
     };
-    if engine::pick(devices, other) == engine::pick(devices, name) {
+    if devices::pick(devices, other) == devices::pick(devices, name) {
         *other = this.clone();
     }
     *this = name.to_string();
@@ -198,12 +198,11 @@ impl Tray {
             return;
         };
         let hide = |n: &str| {
-            let n = n.to_lowercase();
             [&cfg.source, &cfg.volume_endpoint]
                 .iter()
-                .any(|p| !p.is_empty() && n.contains(&p.to_lowercase()))
+                .any(|p| devices::matches(n, p))
         };
-        let devices: Vec<String> = default_device::render_device_names()
+        let devices: Vec<String> = devices::render_device_names()
             .into_iter()
             .filter(|n| !hide(n))
             .collect();
@@ -240,7 +239,7 @@ impl Tray {
     /// Set every check mark from the config
     fn sync(&self, cfg: &Config) {
         for (side, speaker) in self.sides.iter().zip(cfg.speakers()) {
-            let chosen = engine::pick(&self.devices, speaker);
+            let chosen = devices::pick(&self.devices, speaker);
             for (i, item) in side.items.iter().enumerate() {
                 item.set_checked(chosen == Some(i));
             }
@@ -268,7 +267,7 @@ impl Tray {
             edit_config(|c| std::mem::swap(&mut c.left, &mut c.right))
         } else if let Some(side) = test {
             if let Ok(cfg) = config::load() {
-                if let Some(i) = engine::pick(devices, cfg.speakers()[side]) {
+                if let Some(i) = devices::pick(devices, cfg.speakers()[side]) {
                     engine::play_test_tone(devices[i].clone());
                 }
             }

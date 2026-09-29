@@ -10,6 +10,7 @@
 //! drifting further and further apart.
 
 use crate::config::Config;
+use crate::devices;
 use crate::volume::Gain;
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -99,21 +100,8 @@ fn device_name(dev: &cpal::Device) -> Option<String> {
     dev.description().ok().map(|d| d.name().to_owned())
 }
 
-/// Index of the device matching `pat`: an exact (case-insensitive) name match wins,
-/// otherwise the first name containing it. An empty pattern matches nothing.
-pub fn pick(names: &[String], pat: &str) -> Option<usize> {
-    if pat.is_empty() {
-        return None;
-    }
-    let pat = pat.to_lowercase();
-    let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
-    lower
-        .iter()
-        .position(|n| *n == pat)
-        .or_else(|| lower.iter().position(|n| n.contains(&pat)))
-}
-
-/// The playback device (or recording device, if `output` is false) matching `pat`.
+/// The playback device (or recording device, if `output` is false) matching `pat`, chosen as
+/// by [`devices::pick`].
 ///
 /// cpal's `output_devices()` / `input_devices()` are not used: they probe the supported
 /// formats of every device, which takes ~230 ms. Instead all devices are listed by name,
@@ -123,12 +111,11 @@ fn find_in(host: &cpal::Host, pat: &str, output: bool) -> Result<Option<cpal::De
     if pat.is_empty() {
         return Ok(None);
     }
-    let lower = pat.to_lowercase();
-    let mut devs: Vec<(String, cpal::Device)> = host
+    let devs: Vec<(String, cpal::Device)> = host
         .devices()?
         .filter_map(|d| device_name(&d).map(|n| (n, d)))
         // pick() only ever returns a name containing the pattern, so this changes nothing
-        .filter(|(n, _)| n.to_lowercase().contains(&lower))
+        .filter(|(n, _)| devices::matches(n, pat))
         .filter(|(_, d)| {
             if output {
                 d.default_output_config().is_ok()
@@ -137,8 +124,7 @@ fn find_in(host: &cpal::Host, pat: &str, output: bool) -> Result<Option<cpal::De
             }
         })
         .collect();
-    let names: Vec<String> = devs.iter().map(|(n, _)| n.clone()).collect();
-    Ok(pick(&names, pat).map(|i| devs.swap_remove(i).1))
+    Ok(devices::pick_from(devs, pat))
 }
 
 /// Sound source. A matching playback device is preferred and read via loopback capture,
@@ -499,19 +485,6 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn names(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn pick_prefers_exact_match() {
-        let n = names(&["Speaker-Left 2", "speaker-left", "CABLE Input"]);
-        assert_eq!(pick(&n, "Speaker-Left"), Some(1));
-        assert_eq!(pick(&n, "cable"), Some(2));
-        assert_eq!(pick(&n, "nothing"), None);
-        assert_eq!(pick(&n, ""), None);
-    }
 
     /// Resampling 48 kHz to 44.1 kHz yields 44.1/48 as many samples
     #[test]

@@ -10,25 +10,17 @@
 //!   process to end for any reason, including a crash or being killed from Task Manager
 
 use crate::config::{self, Config};
-use crate::engine;
+use crate::devices::{com_init, device_id, enumerator, find_render_device};
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::sync::Mutex;
 use tracing::{error, info};
 
 use policy::IPolicyConfig;
-use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::core::{GUID, HSTRING, PCWSTR};
 use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::Media::Audio::{
-    eConsole, eMultimedia, eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-    DEVICE_STATE_ACTIVE,
-};
-use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
-    STGM_READ,
-};
+use windows::Win32::Media::Audio::{eConsole, eMultimedia, eRender, DEVICE_STATE_ACTIVE};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Threading::{
     OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
 };
@@ -99,71 +91,8 @@ fn restore_file() -> std::path::PathBuf {
     config::data_dir().join(config::RESTORE_FILE)
 }
 
-pub fn com_init() {
-    // Fails harmlessly if COM is already initialized on this thread in another mode
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    }
-}
-
-unsafe fn enumerator() -> windows::core::Result<IMMDeviceEnumerator> {
-    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-}
-
-pub unsafe fn friendly_name(dev: &IMMDevice) -> Option<String> {
-    let store = dev.OpenPropertyStore(STGM_READ).ok()?;
-    let pv = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
-    let p: PWSTR = PropVariantToStringAlloc(&pv).ok()?;
-    let s = p.to_string().ok();
-    CoTaskMemFree(Some(p.0 as *const _));
-    s
-}
-
-/// All active playback devices with their names.
-/// The caller must have initialized COM on this thread.
-unsafe fn render_devices() -> windows::core::Result<Vec<(String, IMMDevice)>> {
-    let coll = enumerator()?.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-    let mut devs = Vec::new();
-    for i in 0..coll.GetCount()? {
-        let dev = coll.Item(i)?;
-        if let Some(name) = friendly_name(&dev) {
-            devs.push((name, dev));
-        }
-    }
-    Ok(devs)
-}
-
-/// Names of all playback devices. They are the same names cpal reports, but reading them
-/// straight from Windows is fast: cpal also probes the supported formats of every device,
-/// which took ~230 ms and stalled the tray on every hover.
-#[tracing::instrument(level = "debug")]
-pub fn render_device_names() -> Vec<String> {
-    com_init();
-    unsafe { render_devices() }
-        .map(|devs| devs.into_iter().map(|(name, _)| name).collect())
-        .unwrap_or_default()
-}
-
-/// Active playback device matching `pattern`, chosen the same way as [`engine::pick`].
-/// The caller must have initialized COM on this thread.
-pub unsafe fn find_render_device(pattern: &str) -> windows::core::Result<Option<IMMDevice>> {
-    let mut devs = render_devices()?;
-    let names: Vec<String> = devs.iter().map(|(n, _)| n.clone()).collect();
-    Ok(engine::pick(&names, pattern).map(|i| devs.swap_remove(i).1))
-}
-
-pub unsafe fn device_id(dev: &IMMDevice) -> Result<String> {
-    let p = dev.GetId()?;
-    let s = p.to_string();
-    CoTaskMemFree(Some(p.0 as *const _));
-    Ok(s?)
-}
-
 unsafe fn render_id(pattern: &str) -> Option<String> {
-    find_render_device(pattern)
-        .ok()
-        .flatten()
-        .and_then(|d| device_id(&d).ok())
+    device_id(&find_render_device(pattern)?)
 }
 
 unsafe fn current_default() -> Option<String> {
@@ -171,7 +100,7 @@ unsafe fn current_default() -> Option<String> {
         .ok()?
         .GetDefaultAudioEndpoint(eRender, eConsole)
         .ok()?;
-    device_id(&dev).ok()
+    device_id(&dev)
 }
 
 unsafe fn is_active(id: &str) -> bool {
