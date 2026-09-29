@@ -11,6 +11,7 @@
 
 use crate::config::Config;
 use crate::devices;
+use crate::meter::{Meter, Reporter};
 use crate::volume::Gain;
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -23,10 +24,12 @@ use rubato::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Source frames the resampler consumes per step
-const CHUNK_IN: usize = 128;
+/// (a speaker needs this much buffered on top of what it plays in one callback, so it is kept
+/// small)
+const CHUNK_IN: usize = 32;
 
 /// One of the engine's three streams
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +56,8 @@ pub type OnError = Arc<dyn Fn(StreamKind) + Send + Sync>;
 
 pub struct Engine {
     streams: Vec<Stream>,
+    /// Logs how the streams are doing, until the engine is dropped
+    _reporter: Reporter,
 }
 
 /// Dropping the engine stops it without waiting for it: dropping a stream joins cpal's stream
@@ -76,12 +81,13 @@ impl Drop for Engine {
     }
 }
 
-/// Error callback for a stream: logs the error, and reports it through `on_error` unless the
-/// stream keeps running anyway.
-fn on_stream_error(stream: StreamKind, on_error: OnError) -> impl FnMut(cpal::Error) + Send {
+/// Error callback for the stream `meter` counts: logs the error, and reports it through
+/// `on_error` unless the stream keeps running anyway.
+fn on_stream_error(meter: Arc<Meter>, on_error: OnError) -> impl FnMut(cpal::Error) + Send {
+    let stream = meter.kind();
     move |e| match e.kind() {
         // Some audio was dropped (e.g. after a brief system stall), but the stream goes on
-        ErrorKind::Xrun => debug!(%stream, "buffer overrun or underrun"),
+        ErrorKind::Xrun => meter.xrun(),
         ErrorKind::DeviceNotAvailable => {
             warn!(%stream, "device disconnected");
             on_error(stream);
@@ -284,14 +290,14 @@ impl Feeder {
     }
 }
 
-/// Output stream for one speaker
+/// Output stream for the speaker of `meter`'s side
 fn build_output(
     dev: &cpal::Device,
-    side: StreamKind,
     in_rate: u32,
     mut cons: HeapCons<f32>,
     target: usize,
     gain: Gain,
+    meter: Arc<Meter>,
     on_error: OnError,
 ) -> Result<Stream> {
     let config = f32_config(dev, true)?;
@@ -301,12 +307,15 @@ fn build_output(
     let mut drift = DriftControl::new(target);
     let mut primed = false;
     let mut smooth = gain.get();
+    let side = meter.kind();
     let device = device_name(dev).unwrap_or_default();
     info!(%side, device, in_rate, out_rate, "output resampling");
 
+    let errors = on_stream_error(meter.clone(), on_error);
     let stream = dev.build_output_stream(
         config,
         move |data: &mut [f32], _| {
+            meter.callback(data.len() / channels, out_rate);
             let tgt = gain.get();
             let avail = cons.occupied_len();
 
@@ -314,6 +323,7 @@ fn build_output(
             if avail > target * 3 {
                 cons.skip(avail - target);
                 drift.reset(target as f32);
+                meter.skip();
             }
             // On startup or after running dry, fill up to the target before playing,
             // so left and right start from the same point
@@ -328,7 +338,9 @@ fn build_output(
                 }
             }
 
-            let rel = drift.update(cons.occupied_len() as f32 + feeder.buffered());
+            let fill = cons.occupied_len() as f32 + feeder.buffered();
+            let rel = drift.update(fill);
+            meter.drift(fill, in_rate, rel);
             feeder.set_relative_ratio(rel);
 
             for frame in data.chunks_mut(channels) {
@@ -338,6 +350,9 @@ fn build_output(
                 let s = match v {
                     Some(v) => v * smooth,
                     None => {
+                        if primed {
+                            meter.dry();
+                        }
                         primed = false;
                         0.0
                     }
@@ -346,7 +361,7 @@ fn build_output(
                 frame.fill(s);
             }
         },
-        on_stream_error(side, on_error),
+        errors,
         None,
     )?;
     stream.play()?;
@@ -413,9 +428,15 @@ impl Engine {
         let (mut lp, lc): (HeapProd<f32>, HeapCons<f32>) = HeapRb::<f32>::new(cap).split();
         let (mut rp, rc): (HeapProd<f32>, HeapCons<f32>) = HeapRb::<f32>::new(cap).split();
 
+        let meters = [StreamKind::Input, StreamKind::Left, StreamKind::Right]
+            .map(|kind| Arc::new(Meter::new(kind)));
+        let [in_meter, left_meter, right_meter] = meters.clone();
+
+        let errors = on_stream_error(in_meter.clone(), on_error.clone());
         let input = in_dev.build_input_stream(
             in_cfg,
             move |data: &[f32], _| {
+                in_meter.callback(data.len() / in_ch, sample_rate);
                 for frame in data.chunks(in_ch) {
                     let l = frame[0];
                     let r = if in_ch > 1 { frame[1] } else { l };
@@ -424,26 +445,26 @@ impl Engine {
                     let _ = rp.try_push(r);
                 }
             },
-            on_stream_error(StreamKind::Input, on_error.clone()),
+            errors,
             None,
         )?;
 
         let left = build_output(
             &left_dev,
-            StreamKind::Left,
             sample_rate,
             lc,
             target,
             gain.clone(),
+            left_meter,
             on_error.clone(),
         )?;
         let right = build_output(
             &right_dev,
-            StreamKind::Right,
             sample_rate,
             rc,
             target,
             gain,
+            right_meter,
             on_error,
         )?;
         input
@@ -462,6 +483,7 @@ impl Engine {
 
         Ok(Engine {
             streams: vec![input, left, right],
+            _reporter: Reporter::start(meters.into()),
         })
     }
 }

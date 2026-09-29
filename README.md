@@ -58,7 +58,7 @@ Right-click the tray icon and check "Start with Windows".
 
 **No sound at all**: Check "Status" in the tray menu and the newest log file. If it says "Choose speakers", pick both speakers in the tray menu.
 
-**Crackling or dropouts**: Set "Latency" in the tray menu to 50 ms.
+**Crackling or dropouts**: Set "Latency" in the tray menu to 50 ms. While it crackles, the log gets an `audio dropouts` line every 10 seconds, showing which speaker ran dry and how late the sound arrived.
 
 **Left and right are swapped**: Choose "Swap left / right" in the tray menu.
 

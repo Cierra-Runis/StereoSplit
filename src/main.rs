@@ -7,6 +7,7 @@ mod default_device;
 mod devices;
 mod engine;
 mod logging;
+mod meter;
 mod session;
 mod supervisor;
 mod toast;
