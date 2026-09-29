@@ -5,7 +5,7 @@ edition = "2021"
 description = "Send the left and right channels of system audio to two separate speakers, following the Windows volume keys"
 
 [dependencies]
-cpal = "0.15"
+cpal = "0.18"
 ringbuf = "0.4"
 rubato = "5"
 serde = { version = "1", features = ["derive"] }

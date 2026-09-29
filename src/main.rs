@@ -73,9 +73,14 @@ fn tray_icon() -> Icon {
 enum Event {
     /// Exit was chosen from the tray menu
     Quit,
-    /// A running audio stream failed (e.g. a speaker was unplugged). Holds the generation of
-    /// the engine it came from, since a stopped engine can still report failures for a while.
-    Failed(u64),
+    /// A running audio stream failed (e.g. a speaker was unplugged)
+    Failed {
+        /// Of the engine it came from, since a stopped engine can still report failures
+        /// for a while
+        generation: u64,
+        /// "input", "left" or "right"
+        stream: &'static str,
+    },
     /// config.toml was saved, from the tray menu or by hand
     ConfigChanged,
 }
@@ -144,7 +149,7 @@ fn wait(rx: &Receiver<Event>, timeout: Option<Duration>) -> bool {
         match ev {
             Event::Quit => return false,
             Event::ConfigChanged => return debounce(rx),
-            Event::Failed(_) => {}
+            Event::Failed { .. } => {}
         }
     }
 }
@@ -163,6 +168,9 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
         let _watcher = watch_config(tx.clone());
         // Counts engine starts, so failures from an earlier engine can be told apart
         let mut generation = 0u64;
+        // The config whose engine was running until the audio was interrupted (e.g. a speaker
+        // was unplugged). Starting it again is reconnecting, not a new failure to start.
+        let mut interrupted: Option<Config> = None;
 
         loop {
             let cfg = match config::load() {
@@ -207,14 +215,15 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
             let on_error: engine::OnError = {
                 let tx = tx.clone();
                 let generation = generation;
-                Arc::new(move || {
-                    let _ = tx.send(Event::Failed(generation));
+                Arc::new(move |stream| {
+                    let _ = tx.send(Event::Failed { generation, stream });
                 })
             };
 
-            let go_on = match engine::spawn(cfg.clone(), gain, on_error) {
+            let go_on = match engine::Engine::start(&cfg, gain, on_error) {
                 Ok(engine) => {
                     shown_error = None;
+                    interrupted = None;
                     set_status("Running");
                     match default_device::take_over(&cfg) {
                         Ok(()) => managed = true,
@@ -226,19 +235,32 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                     let ev = loop {
                         match rx.recv() {
                             // From an engine that was already stopped
-                            Ok(Event::Failed(g)) if g != generation => {}
+                            Ok(Event::Failed { generation: g, .. }) if g != generation => {}
                             Ok(ev) => break ev,
                             Err(_) => break Event::Quit,
                         }
                     };
-                    // Stops the engine without waiting for it (see `engine::Running`)
+                    // Stops the engine without waiting for it (see `engine::Engine`)
                     drop(engine);
                     match ev {
                         Event::Quit => false,
                         Event::ConfigChanged => debounce(&rx),
-                        Event::Failed(_) => {
-                            warn!(retry_in_secs = 2, "audio interrupted, reconnecting");
+                        Event::Failed { stream, .. } => {
+                            warn!(stream, retry_in_secs = 2, "audio interrupted, reconnecting");
                             set_status("Reconnecting");
+                            // Shown once; the retries stay quiet until it's back
+                            let (what, name) = match stream {
+                                "left" => ("Left speaker", &cfg.left),
+                                "right" => ("Right speaker", &cfg.right),
+                                _ => ("Sound source", &cfg.source),
+                            };
+                            toast::show(
+                                &format!("{what} disconnected"),
+                                &format!(
+                                    "Lost \"{name}\". Reconnecting automatically once it's back."
+                                ),
+                            );
+                            interrupted = Some(cfg.clone());
                             wait(&rx, Some(Duration::from_secs(2)))
                         }
                     }
@@ -246,13 +268,20 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                 Err(e) => {
                     let msg = format!("{e:#}");
                     error!(error = %msg, retry_in_secs = 3, "failed to start the engine");
-                    set_status("Failed to start (see log)");
+                    // Once the config is changed, a failure is a failure to start again
+                    let reconnecting = interrupted.as_ref() == Some(&cfg);
+                    set_status(if reconnecting {
+                        "Reconnecting"
+                    } else {
+                        "Failed to start (see log)"
+                    });
                     // Nothing is playing through the source now, so let Windows play
                     // straight to a speaker until the engine is back
                     release(&cfg, &mut managed);
                     // Show each distinct error only once, then retry silently
-                    // (e.g. a speaker that isn't plugged in yet)
-                    if shown_error.as_deref() != Some(msg.as_str()) {
+                    // (e.g. a speaker that isn't plugged in yet). Nothing is shown while
+                    // reconnecting: the disconnect was shown already.
+                    if !reconnecting && shown_error.as_deref() != Some(msg.as_str()) {
                         toast::show(
                             "Failed to start",
                             &format!("{msg}\n\nRetrying automatically every 3 seconds."),

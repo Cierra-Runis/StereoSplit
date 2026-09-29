@@ -13,70 +13,67 @@ use crate::config::Config;
 use crate::volume::Gain;
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, SampleFormat, Stream, StreamConfig};
+use cpal::{BufferSize, ErrorKind, SampleFormat, Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
     Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction,
 };
-use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Source frames the resampler consumes per step
 const CHUNK_IN: usize = 128;
 
-/// Called from an audio thread when a stream fails (e.g. a speaker was unplugged)
-pub type OnError = Arc<dyn Fn() + Send + Sync>;
+/// Called from an audio thread when a stream fails (e.g. a speaker was unplugged), with the
+/// stream that failed: "input", "left" or "right"
+pub type OnError = Arc<dyn Fn(&'static str) + Send + Sync>;
 
-struct Engine {
-    _input: Stream,
-    _left: Stream,
-    _right: Stream,
+pub struct Engine {
+    streams: Vec<Stream>,
 }
 
-/// A running engine, which lives on a thread of its own.
-///
-/// Dropping this tells the engine to stop, without waiting for it: stopping joins cpal's
-/// stream threads, which could hang forever on a wedged driver (e.g. a USB speaker pulled out
+/// Dropping the engine stops it without waiting for it: dropping a stream joins cpal's stream
+/// thread, which could hang forever on a wedged driver (e.g. a USB speaker pulled out
 /// mid-call), and the caller must be able to go on reconnecting regardless. So `on_error` may
-/// still be called for a while after this is dropped.
-pub struct Running {
-    _stop: Sender<()>,
+/// still be called for a while after the engine is dropped.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let streams = std::mem::take(&mut self.streams);
+        // If the thread can't be started, the streams are dropped right here instead
+        let _ = std::thread::Builder::new()
+            .name("engine-stop".into())
+            .spawn(move || {
+                let t = Instant::now();
+                drop(streams);
+                let elapsed_ms = t.elapsed().as_millis() as u64;
+                if elapsed_ms > 1000 {
+                    warn!(elapsed_ms, "engine was slow to stop");
+                }
+            });
+    }
 }
 
-/// Start the engine on a thread of its own, returning once it is playing (or failed to start).
-/// cpal's streams can't be sent to another thread, so the thread that builds them also drops them.
-pub fn spawn(cfg: Config, gain: Gain, on_error: OnError) -> Result<Running> {
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let (started_tx, started_rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("engine".into())
-        .spawn(move || {
-            let engine = match Engine::start(&cfg, gain, on_error) {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = started_tx.send(Err(e));
-                    return;
-                }
-            };
-            let _ = started_tx.send(Ok(()));
-            // Returns once the `Running` handle is dropped
-            let _ = stop_rx.recv();
-            let t = Instant::now();
-            drop(engine);
-            let elapsed_ms = t.elapsed().as_millis() as u64;
-            if elapsed_ms > 1000 {
-                warn!(elapsed_ms, "engine was slow to stop");
-            }
-        })
-        .context("Failed to start the audio thread")?;
-    started_rx
-        .recv()
-        .unwrap_or_else(|_| Err(anyhow!("The audio thread crashed while starting")))?;
-    Ok(Running { _stop: stop_tx })
+/// Error callback for a stream: logs the error, and reports it through `on_error` unless the
+/// stream keeps running anyway. `stream` is "input", "left" or "right".
+fn on_stream_error(stream: &'static str, on_error: OnError) -> impl FnMut(cpal::Error) + Send {
+    move |e| match e.kind() {
+        // Some audio was dropped (e.g. after a brief system stall), but the stream goes on
+        ErrorKind::Xrun => debug!(stream, "buffer overrun or underrun"),
+        _ => {
+            error!(stream, error = %e, "stream error");
+            on_error(stream);
+        }
+    }
+}
+
+/// The device's name, as Windows shows it (its FriendlyName, the same name
+/// `default_device` reads). `Device`'s `Display` is not used: it fails when the name can't be
+/// read, and `to_string()` panics on that.
+fn device_name(dev: &cpal::Device) -> Option<String> {
+    dev.description().ok().map(|d| d.name().to_owned())
 }
 
 /// Index of the device matching `pat`: an exact (case-insensitive) name match wins,
@@ -106,7 +103,7 @@ fn find_in(host: &cpal::Host, pat: &str, output: bool) -> Result<Option<cpal::De
     let lower = pat.to_lowercase();
     let mut devs: Vec<(String, cpal::Device)> = host
         .devices()?
-        .filter_map(|d| d.name().ok().map(|n| (n, d)))
+        .filter_map(|d| device_name(&d).map(|n| (n, d)))
         // pick() only ever returns a name containing the pattern, so this changes nothing
         .filter(|(n, _)| n.to_lowercase().contains(&lower))
         .filter(|(_, d)| {
@@ -274,14 +271,14 @@ fn build_output(
     gain: Gain,
     on_error: OnError,
 ) -> Result<Stream> {
-    let name = dev.name().unwrap_or_default();
+    let name = device_name(dev).unwrap_or_default();
     let sup = dev
         .default_output_config()
         .with_context(|| format!("Failed to read the output format of \"{name}\""))?;
     if sup.sample_format() != SampleFormat::F32 {
         bail!("\"{name}\" does not use 32-bit float samples, which is not supported yet");
     }
-    let out_rate = sup.sample_rate().0;
+    let out_rate = sup.sample_rate();
     let channels = sup.channels() as usize;
     let mut cfg: StreamConfig = sup.config();
     cfg.buffer_size = BufferSize::Default;
@@ -293,7 +290,7 @@ fn build_output(
     info!(side, device = %name, in_rate, out_rate, "output resampling");
 
     let stream = dev.build_output_stream(
-        &cfg,
+        cfg,
         move |data: &mut [f32], _| {
             let tgt = gain.get();
             let avail = cons.occupied_len();
@@ -334,10 +331,7 @@ fn build_output(
                 frame.fill(s);
             }
         },
-        move |e| {
-            error!(side, error = %e, "output stream error");
-            on_error();
-        },
+        on_stream_error(side, on_error),
         None,
     )?;
     stream.play()?;
@@ -366,11 +360,11 @@ fn test_tone(device: &str) -> Result<()> {
     if sup.sample_format() != SampleFormat::F32 {
         bail!("the device does not use 32-bit float samples");
     }
-    let rate = sup.sample_rate().0 as f32;
+    let rate = sup.sample_rate() as f32;
     let channels = sup.channels() as usize;
     let mut n = 0u32;
     let stream = dev.build_output_stream(
-        &sup.config(),
+        sup.config(),
         move |data: &mut [f32], _| {
             for frame in data.chunks_mut(channels) {
                 let t = n as f32 / rate;
@@ -390,7 +384,7 @@ fn test_tone(device: &str) -> Result<()> {
 
 impl Engine {
     #[tracing::instrument(level = "info", skip_all)]
-    fn start(cfg: &Config, gain: Gain, on_error: OnError) -> Result<Engine> {
+    pub fn start(cfg: &Config, gain: Gain, on_error: OnError) -> Result<Engine> {
         let host = cpal::default_host();
 
         let source = find_source(&host, &cfg.source)?;
@@ -408,12 +402,12 @@ impl Engine {
                 (d, sup, "recording device")
             }
         };
-        let in_name = in_dev.name().unwrap_or_default();
+        let in_name = device_name(&in_dev).unwrap_or_default();
         let sup = sup.with_context(|| format!("Failed to read the format of \"{in_name}\""))?;
         if sup.sample_format() != SampleFormat::F32 {
             bail!("\"{in_name}\" does not use 32-bit float samples, which is not supported yet");
         }
-        let sample_rate = sup.sample_rate().0;
+        let sample_rate = sup.sample_rate();
         let in_ch = sup.channels() as usize;
         let mut in_cfg: StreamConfig = sup.config();
         in_cfg.buffer_size = BufferSize::Default;
@@ -426,9 +420,8 @@ impl Engine {
         let (mut lp, lc): (HeapProd<f32>, HeapCons<f32>) = HeapRb::<f32>::new(cap).split();
         let (mut rp, rc): (HeapProd<f32>, HeapCons<f32>) = HeapRb::<f32>::new(cap).split();
 
-        let on_input_error = on_error.clone();
         let input = in_dev.build_input_stream(
-            &in_cfg,
+            in_cfg,
             move |data: &[f32], _| {
                 for frame in data.chunks(in_ch) {
                     let l = frame[0];
@@ -438,10 +431,7 @@ impl Engine {
                     let _ = rp.try_push(r);
                 }
             },
-            move |e| {
-                error!(error = %e, "input stream error");
-                on_input_error();
-            },
+            on_stream_error("input", on_error.clone()),
             None,
         )?;
 
@@ -470,17 +460,15 @@ impl Engine {
         info!(
             mode,
             input = %in_name,
-            left = %left_dev.name().unwrap_or_default(),
-            right = %right_dev.name().unwrap_or_default(),
+            left = %device_name(&left_dev).unwrap_or_default(),
+            right = %device_name(&right_dev).unwrap_or_default(),
             sample_rate,
             latency_ms = cfg.latency_ms,
             "engine started"
         );
 
         Ok(Engine {
-            _input: input,
-            _left: left,
-            _right: right,
+            streams: vec![input, left, right],
         })
     }
 }
