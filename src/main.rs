@@ -6,16 +6,17 @@ mod default_device;
 mod device_watch;
 mod engine;
 mod logging;
+mod supervisor;
 mod toast;
 mod volume;
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use config::Config;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tray_icon::menu::{
     CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
@@ -41,13 +42,6 @@ const APP_NAME: &str = env!("APP_NAME");
 const ICON_RESOURCE: &str = env!("ICON_RESOURCE");
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const LATENCIES: [u32; 4] = [15, 20, 30, 50];
-/// How long to wait before retrying a failed start when no device change comes first.
-/// Device changes retry right away; this covers failures they don't announce, such as a
-/// speaker held by another app in exclusive mode.
-const RETRY_FALLBACK: Duration = Duration::from_secs(30);
-/// Quiet time that ends a burst of config saves or of device changes (see `debounce`)
-const CONFIG_QUIET: Duration = Duration::from_millis(150);
-const DEVICES_QUIET: Duration = Duration::from_millis(500);
 
 fn autostart_enabled() -> bool {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -74,286 +68,6 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
 fn tray_icon() -> Icon {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) } as u32;
     Icon::from_resource_name(ICON_RESOURCE, Some((size, size))).expect("icon resource")
-}
-
-/// What the supervisor thread waits for
-enum Event {
-    /// Exit was chosen from the tray menu
-    Quit,
-    /// A running audio stream failed (e.g. a speaker was unplugged)
-    Failed {
-        /// Of the engine it came from, since a stopped engine can still report failures
-        /// for a while
-        generation: u64,
-        /// "input", "left" or "right"
-        stream: &'static str,
-    },
-    /// config.toml was saved, from the tray menu or by hand
-    ConfigChanged,
-    /// An audio device was plugged in, unplugged, enabled or disabled
-    DevicesChanged,
-}
-
-/// Report saves of config.toml. The folder is watched rather than the file, since some
-/// editors save by writing a new file and renaming it over the old one.
-fn watch_config(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
-    use notify::{EventKind, RecursiveMode, Watcher};
-    let handler = move |res: notify::Result<notify::Event>| {
-        let Ok(ev) = res else { return };
-        let saved = matches!(
-            ev.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        ) && ev
-            .paths
-            .iter()
-            .any(|p| p.file_name().is_some_and(|n| n == config::CONFIG_FILE));
-        if saved {
-            let _ = tx.send(Event::ConfigChanged);
-        }
-    };
-    let watcher = notify::recommended_watcher(handler).and_then(|mut w| {
-        w.watch(config::data_dir(), RecursiveMode::NonRecursive)?;
-        Ok(w)
-    });
-    match watcher {
-        Ok(w) => Some(w),
-        Err(e) => {
-            warn!(
-                error = %e,
-                "can't watch the config file; changes made by hand need a restart"
-            );
-            None
-        }
-    }
-}
-
-/// Let a change settle until nothing arrives for `quiet`: one save often arrives as several
-/// events (e.g. truncate, then write), and so does plugging in a device.
-/// Returns false on quit.
-fn debounce(rx: &Receiver<Event>, quiet: Duration) -> bool {
-    loop {
-        match rx.recv_timeout(quiet) {
-            Ok(Event::Quit) | Err(RecvTimeoutError::Disconnected) => return false,
-            Ok(_) => {}
-            Err(RecvTimeoutError::Timeout) => return true,
-        }
-    }
-}
-
-/// Wait for the config to change. With `retry`, also stop waiting when a device changes or
-/// after the time given, whichever comes first. Returns false on quit.
-/// Failures still queued from an engine that is already gone are skipped here.
-fn wait(rx: &Receiver<Event>, retry: Option<Duration>) -> bool {
-    let deadline = retry.map(|t| Instant::now() + t);
-    loop {
-        let ev = match deadline {
-            Some(d) => match rx.recv_timeout(d.saturating_duration_since(Instant::now())) {
-                Ok(ev) => ev,
-                Err(RecvTimeoutError::Timeout) => return true,
-                Err(RecvTimeoutError::Disconnected) => return false,
-            },
-            None => match rx.recv() {
-                Ok(ev) => ev,
-                Err(_) => return false,
-            },
-        };
-        match ev {
-            Event::Quit => return false,
-            Event::ConfigChanged => return debounce(rx, CONFIG_QUIET),
-            Event::DevicesChanged if retry.is_some() => return debounce(rx, DEVICES_QUIET),
-            Event::DevicesChanged | Event::Failed { .. } => {}
-        }
-    }
-}
-
-/// Audio supervisor thread: starts the engine, retries automatically after errors (e.g. a
-/// speaker being unplugged), and restarts with the new config whenever config.toml changes
-/// (whether from the tray menu or edited by hand).
-fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<String>>) {
-    std::thread::spawn(move || {
-        let set_status = |s: &str| *status.lock().unwrap() = s.into();
-        let mut shown_error: Option<String> = None;
-        // Last start error written to the log, so retries that fail the same way don't
-        // repeat it
-        let mut logged_error: Option<String> = None;
-        let mut hinted = false;
-        // Whether this process has made the source the default playback device
-        let mut managed = false;
-
-        let _watcher = watch_config(tx.clone());
-        default_device::com_init();
-        let devices_tx = tx.clone();
-        let _devices = unsafe {
-            device_watch::DeviceWatch::new(move || {
-                let _ = devices_tx.send(Event::DevicesChanged);
-            })
-        }
-        .inspect_err(|e| {
-            warn!(
-                error = %e,
-                retry_in_secs = RETRY_FALLBACK.as_secs(),
-                "can't watch for device changes; reconnecting only retries on a timer"
-            )
-        })
-        .ok();
-        // Follows the volume of `volume_endpoint`; replaced only when that setting changes
-        let mut volume: Option<volume::Follower> = None;
-        // Counts engine starts, so failures from an earlier engine can be told apart
-        let mut generation = 0u64;
-        // The config whose engine was running until the audio was interrupted (e.g. a speaker
-        // was unplugged). Starting it again is reconnecting, not a new failure to start.
-        let mut interrupted: Option<Config> = None;
-
-        loop {
-            let cfg = match config::load() {
-                Ok(c) => c,
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    error!(error = %msg, "failed to load the config");
-                    set_status("Config error");
-                    if shown_error.as_deref() != Some(msg.as_str()) {
-                        toast::show("Config error", &msg);
-                        shown_error = Some(msg);
-                    }
-                    if !wait(&rx, None) {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            if cfg.left.is_empty() || cfg.right.is_empty() {
-                release(&cfg, &mut managed);
-                set_status("Choose speakers");
-                if !hinted {
-                    hinted = true;
-                    toast::show(
-                        "Choose speakers",
-                        "Right-click the tray icon (the blue and orange dot) and choose your \
-                         speakers under \"Left speaker\" and \"Right speaker\".",
-                    );
-                }
-                if !wait(&rx, None) {
-                    break;
-                }
-                continue;
-            }
-
-            let gain = match &volume {
-                Some(v) if v.pattern() == cfg.volume_endpoint => v.gain(),
-                _ => volume
-                    .insert(volume::Follower::start(cfg.volume_endpoint.clone()))
-                    .gain(),
-            };
-
-            generation += 1;
-            let on_error: engine::OnError = {
-                let tx = tx.clone();
-                let generation = generation;
-                Arc::new(move |stream| {
-                    let _ = tx.send(Event::Failed { generation, stream });
-                })
-            };
-
-            let go_on = match engine::Engine::start(&cfg, gain, on_error) {
-                Ok(engine) => {
-                    shown_error = None;
-                    logged_error = None;
-                    interrupted = None;
-                    set_status("Running");
-                    match default_device::take_over(&cfg) {
-                        Ok(()) => managed = true,
-                        Err(e) => error!(
-                            error = %format_args!("{e:#}"),
-                            "failed to switch the default playback device"
-                        ),
-                    }
-                    let ev = loop {
-                        match rx.recv() {
-                            // From an engine that was already stopped
-                            Ok(Event::Failed { generation: g, .. }) if g != generation => {}
-                            // A running engine hears about its own devices going away
-                            Ok(Event::DevicesChanged) => {}
-                            Ok(ev) => break ev,
-                            Err(_) => break Event::Quit,
-                        }
-                    };
-                    // Stops the engine without waiting for it (see `engine::Engine`)
-                    drop(engine);
-                    match ev {
-                        Event::Quit => false,
-                        Event::ConfigChanged => debounce(&rx, CONFIG_QUIET),
-                        Event::DevicesChanged => unreachable!("skipped above"),
-                        Event::Failed { stream, .. } => {
-                            warn!(stream, retry_in_secs = 2, "audio interrupted, reconnecting");
-                            set_status("Reconnecting");
-                            // Shown once; the retries stay quiet until it's back
-                            let (what, name) = match stream {
-                                "left" => ("Left speaker", &cfg.left),
-                                "right" => ("Right speaker", &cfg.right),
-                                _ => ("Sound source", &cfg.source),
-                            };
-                            toast::show(
-                                &format!("{what} disconnected"),
-                                &format!(
-                                    "Lost \"{name}\". Reconnecting automatically once it's back."
-                                ),
-                            );
-                            interrupted = Some(cfg.clone());
-                            wait(&rx, Some(Duration::from_secs(2)))
-                        }
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    if logged_error.as_deref() != Some(msg.as_str()) {
-                        error!(error = %msg, "failed to start the engine");
-                        logged_error = Some(msg.clone());
-                    } else {
-                        debug!(error = %msg, "failed to start the engine again");
-                    }
-                    // Once the config is changed, a failure is a failure to start again
-                    let reconnecting = interrupted.as_ref() == Some(&cfg);
-                    set_status(if reconnecting {
-                        "Reconnecting"
-                    } else {
-                        "Failed to start (see log)"
-                    });
-                    // Nothing is playing through the source now, so let Windows play
-                    // straight to a speaker until the engine is back
-                    release(&cfg, &mut managed);
-                    // Show each distinct error only once, then retry silently
-                    // (e.g. a speaker that isn't plugged in yet). Nothing is shown while
-                    // reconnecting: the disconnect was shown already.
-                    if !reconnecting && shown_error.as_deref() != Some(msg.as_str()) {
-                        toast::show(
-                            "Failed to start",
-                            &format!(
-                                "{msg}\n\nRetrying automatically when a device is plugged in."
-                            ),
-                        );
-                        shown_error = Some(msg);
-                    }
-                    wait(&rx, Some(RETRY_FALLBACK))
-                }
-            };
-            if !go_on {
-                break;
-            }
-        }
-    });
-}
-
-/// Switch the default playback device back if this process took it over
-fn release(cfg: &Config, managed: &mut bool) {
-    if std::mem::take(managed) {
-        if let Err(e) = default_device::restore(cfg) {
-            error!(
-                error = %format_args!("{e:#}"),
-                "failed to switch the default playback device back"
-            );
-        }
-    }
 }
 
 /// Load the config, change it and save it. On a broken config file nothing is changed.
@@ -700,8 +414,8 @@ fn main() {
     create_session_window();
 
     let (tx, rx) = mpsc::channel();
-    let status = Arc::new(Mutex::new(String::from("Starting")));
-    spawn_supervisor(tx.clone(), rx, status.clone());
+    let status = Arc::new(Mutex::new("Starting"));
+    supervisor::spawn(tx.clone(), rx, status.clone());
 
     let mut tray = Tray::new();
     tray.refresh();
@@ -743,7 +457,7 @@ fn main() {
 
             while let Ok(ev) = menu_rx.try_recv() {
                 if ev.id == *tray.quit.id() {
-                    let _ = tx.send(Event::Quit);
+                    let _ = tx.send(supervisor::Event::Quit);
                     PostQuitMessage(0);
                 } else {
                     tray.handle(&ev.id);
