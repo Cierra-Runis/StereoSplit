@@ -10,6 +10,7 @@
 //!   process to end for any reason, including a crash or being killed from Task Manager
 
 use crate::config::{self, Config};
+use crate::engine;
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::sync::Mutex;
@@ -118,28 +119,37 @@ pub unsafe fn friendly_name(dev: &IMMDevice) -> Option<String> {
     s
 }
 
-/// First active playback device whose name contains `pattern` (case-insensitive).
+/// All active playback devices with their names.
 /// The caller must have initialized COM on this thread.
-pub unsafe fn find_render_device(pattern: &str) -> windows::core::Result<Option<IMMDevice>> {
-    if pattern.is_empty() {
-        return Ok(None);
-    }
+unsafe fn render_devices() -> windows::core::Result<Vec<(String, IMMDevice)>> {
     let coll = enumerator()?.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-    let pat = pattern.to_lowercase();
-    let mut first = None;
+    let mut devs = Vec::new();
     for i in 0..coll.GetCount()? {
         let dev = coll.Item(i)?;
         if let Some(name) = friendly_name(&dev) {
-            let name = name.to_lowercase();
-            if name == pat {
-                return Ok(Some(dev));
-            }
-            if first.is_none() && name.contains(&pat) {
-                first = Some(dev);
-            }
+            devs.push((name, dev));
         }
     }
-    Ok(first)
+    Ok(devs)
+}
+
+/// Names of all playback devices. They are the same names cpal reports, but reading them
+/// straight from Windows is fast: cpal also probes the supported formats of every device,
+/// which took ~230 ms and stalled the tray on every hover.
+#[tracing::instrument(level = "debug")]
+pub fn render_device_names() -> Vec<String> {
+    com_init();
+    unsafe { render_devices() }
+        .map(|devs| devs.into_iter().map(|(name, _)| name).collect())
+        .unwrap_or_default()
+}
+
+/// Active playback device matching `pattern`, chosen the same way as [`engine::pick`].
+/// The caller must have initialized COM on this thread.
+pub unsafe fn find_render_device(pattern: &str) -> windows::core::Result<Option<IMMDevice>> {
+    let mut devs = render_devices()?;
+    let names: Vec<String> = devs.iter().map(|(n, _)| n.clone()).collect();
+    Ok(engine::pick(&names, pattern).map(|i| devs.swap_remove(i).1))
 }
 
 unsafe fn device_id(dev: &IMMDevice) -> Result<String> {

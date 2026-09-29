@@ -50,20 +50,32 @@ pub fn pick(names: &[String], pat: &str) -> Option<usize> {
         .or_else(|| lower.iter().position(|n| n.contains(&pat)))
 }
 
-fn find_in(devs: impl Iterator<Item = cpal::Device>, pat: &str) -> Option<cpal::Device> {
-    let mut devs: Vec<(String, cpal::Device)> =
-        devs.filter_map(|d| d.name().ok().map(|n| (n, d))).collect();
+/// The playback device (or recording device, if `output` is false) matching `pat`.
+///
+/// cpal's `output_devices()` / `input_devices()` are not used: they probe the supported
+/// formats of every device, which takes ~230 ms. Instead all devices are listed by name,
+/// and only the ones whose name could match are checked for their direction (which fails
+/// right away for a device of the other direction).
+fn find_in(host: &cpal::Host, pat: &str, output: bool) -> Result<Option<cpal::Device>> {
+    if pat.is_empty() {
+        return Ok(None);
+    }
+    let lower = pat.to_lowercase();
+    let mut devs: Vec<(String, cpal::Device)> = host
+        .devices()?
+        .filter_map(|d| d.name().ok().map(|n| (n, d)))
+        // pick() only ever returns a name containing the pattern, so this changes nothing
+        .filter(|(n, _)| n.to_lowercase().contains(&lower))
+        .filter(|(_, d)| {
+            if output {
+                d.default_output_config().is_ok()
+            } else {
+                d.default_input_config().is_ok()
+            }
+        })
+        .collect();
     let names: Vec<String> = devs.iter().map(|(n, _)| n.clone()).collect();
-    pick(&names, pat).map(|i| devs.swap_remove(i).1)
-}
-
-/// Names of all playback devices
-#[tracing::instrument(level = "debug")]
-pub fn output_device_names() -> Vec<String> {
-    cpal::default_host()
-        .output_devices()
-        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
-        .unwrap_or_default()
+    Ok(pick(&names, pat).map(|i| devs.swap_remove(i).1))
 }
 
 /// Sound source. A matching playback device is preferred and read via loopback capture,
@@ -76,17 +88,17 @@ enum Source {
 }
 
 fn find_source(host: &cpal::Host, pat: &str) -> Result<Source> {
-    if let Some(d) = find_in(host.output_devices()?, pat) {
+    if let Some(d) = find_in(host, pat, true)? {
         return Ok(Source::Loopback(d));
     }
-    if let Some(d) = find_in(host.input_devices()?, pat) {
+    if let Some(d) = find_in(host, pat, false)? {
         return Ok(Source::Recording(d));
     }
     bail!("Sound source \"{pat}\" not found. Make sure VB-CABLE is installed.")
 }
 
 fn find_output(host: &cpal::Host, pat: &str) -> Result<cpal::Device> {
-    find_in(host.output_devices()?, pat).ok_or_else(|| {
+    find_in(host, pat, true)?.ok_or_else(|| {
         anyhow!(
             "Playback device \"{pat}\" not found. Make sure the speaker is connected via USB, \
              or choose another one in the tray menu."

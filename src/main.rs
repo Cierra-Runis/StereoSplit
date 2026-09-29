@@ -388,7 +388,7 @@ impl Tray {
                 .iter()
                 .any(|p| !p.is_empty() && n.contains(&p.to_lowercase()))
         };
-        let devices: Vec<String> = engine::output_device_names()
+        let devices: Vec<String> = default_device::render_device_names()
             .into_iter()
             .filter(|n| !hide(n))
             .collect();
