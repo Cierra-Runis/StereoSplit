@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -22,7 +22,7 @@ pub const RESTORE_FILE: &str = "restore-device.txt";
 /// effect as soon as it is saved.
 /// Device names are matched by case-insensitive substring, so part of the name is enough.
 ///
-#[derive(Debug, Clone, PartialEq, Deserialize, SmartDefault, TomlExample)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, SmartDefault, TomlExample)]
 #[serde(default)]
 pub struct Config {
     /// Speaker for the left channel
@@ -55,23 +55,19 @@ impl Config {
 }
 
 /// `text` with the values from `cfg` put in. Everything else in it (comments, order, layout)
-/// is kept as is.
+/// is kept as is. The values come from serializing `cfg`, so every field is written.
 fn update(text: &str, cfg: &Config) -> Result<String> {
     let mut doc: DocumentMut = text.parse()?;
-    let values: [(&str, toml_edit::Value); 5] = [
-        ("left", cfg.left.as_str().into()),
-        ("right", cfg.right.as_str().into()),
-        ("latency_ms", i64::from(cfg.latency_ms).into()),
-        ("source", cfg.source.as_str().into()),
-        ("volume_endpoint", cfg.volume_endpoint.as_str().into()),
-    ];
-    for (key, mut value) in values {
+    for (key, mut item) in toml_edit::ser::to_document(cfg)?.into_table() {
         // Comments above a key belong to the key and stay on their own; a comment after the
         // value belongs to the value, so carry it over
-        if let Some(old) = doc.get(key).and_then(|item| item.as_value()) {
+        if let (Some(value), Some(old)) = (
+            item.as_value_mut(),
+            doc.get(&key).and_then(|old| old.as_value()),
+        ) {
             *value.decor_mut() = old.decor().clone();
         }
-        doc[key] = toml_edit::Item::Value(value);
+        doc[key.as_str()] = item;
     }
     Ok(doc.to_string())
 }
