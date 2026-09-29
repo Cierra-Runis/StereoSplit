@@ -168,9 +168,14 @@ impl State {
     }
 }
 
-/// Start the supervisor thread. It shows what it's doing in `status`, and ends on
-/// [`Event::Quit`].
-pub fn spawn(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<&'static str>>) {
+/// Start the supervisor thread. It shows what it's doing in `status`, calls `on_change` when
+/// config.toml or the audio devices change, and ends on [`Event::Quit`].
+pub fn spawn(
+    tx: Sender<Event>,
+    rx: Receiver<Event>,
+    status: Arc<Mutex<&'static str>>,
+    on_change: impl Fn() + Send + 'static,
+) {
     std::thread::spawn(move || {
         let _watcher = watch_config(tx.clone());
         devices::com_init();
@@ -211,6 +216,9 @@ pub fn spawn(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<&'static 
                     retry_at = state.attempted(audio.start()).map(|d| Instant::now() + d)
                 }
                 Ok(ev) => {
+                    if matches!(ev, Event::ConfigChanged | Event::DevicesChanged) {
+                        on_change();
+                    }
                     if let Some(d) = state.on_event(ev) {
                         retry_at = Some(Instant::now() + d);
                     }

@@ -12,7 +12,10 @@ mod supervisor;
 mod toast;
 mod volume;
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,13 +27,15 @@ use tray_icon::menu::{
 };
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::System::Recovery::{RegisterApplicationRestart, RESTART_NO_REBOOT};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, GetSystemMetrics, PostQuitMessage, TranslateMessage, MSG,
-    SM_CXSMICON,
+    DispatchMessageW, GetMessageW, GetSystemMetrics, PostQuitMessage, PostThreadMessageW,
+    TranslateMessage, MSG, SM_CXSMICON, WM_NULL,
 };
 
 /// Both defined in build.rs, which also writes them into the exe's resources
@@ -46,22 +51,18 @@ fn tray_icon() -> Icon {
 }
 
 /// Load the config, change it and save it. On a broken config file nothing is changed.
-fn edit_config(f: impl FnOnce(&mut Config)) -> Option<Config> {
+fn edit_config(f: impl FnOnce(&mut Config)) {
     match config::load() {
         Ok(mut cfg) => {
             f(&mut cfg);
             if let Err(e) = config::save(&cfg) {
                 toast::show("Failed to save the config", &format!("{e:#}"));
             }
-            Some(cfg)
         }
-        Err(e) => {
-            toast::show(
-                "Config error",
-                &format!("{e:#}\n\nFix config.toml (or delete it to start over) first."),
-            );
-            None
-        }
+        Err(e) => toast::show(
+            "Config error",
+            &format!("{e:#}\n\nFix config.toml (or delete it to start over) first."),
+        ),
     }
 }
 
@@ -83,94 +84,94 @@ fn menu_text(s: &str) -> String {
     s.replace('&', "&&")
 }
 
-/// The menu items for one speaker
-struct SideMenu {
-    /// Lists the speakers in `Tray::devices`, one item each, in the same order
-    menu: Submenu,
-    items: Vec<CheckMenuItem>,
-    test: MenuItem,
+/// Play the test tone on the speaker chosen for `side`
+fn test_tone(devices: &[String], side: usize) {
+    let Ok(cfg) = config::load() else {
+        return;
+    };
+    if let Some(i) = devices::pick(devices, cfg.speakers()[side]) {
+        engine::play_test_tone(devices[i].clone());
+    }
 }
 
-impl SideMenu {
-    fn new(menu: &str, test: &str) -> SideMenu {
-        SideMenu {
-            menu: Submenu::new(menu, true),
-            items: Vec::new(),
-            test: MenuItem::new(test, true, None),
-        }
+fn toggle_autostart() {
+    if let Err(e) = autostart::set(!autostart::enabled()) {
+        toast::show(
+            "Failed to enable/disable start with Windows",
+            &e.to_string(),
+        );
+    }
+}
+
+/// Show `path` in Explorer
+fn open(path: &Path) {
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+
+/// What clicking a menu item does
+#[derive(Clone, Copy)]
+enum Action {
+    /// `Speaker(side, i)`: put `Tray::devices[i]` on `side` (0 = left, 1 = right)
+    Speaker(usize, usize),
+    /// Play the test tone on a side
+    Test(usize),
+    Swap,
+    Latency(u32),
+    Autostart,
+    OpenConfig,
+    OpenLog,
+    Quit,
+}
+
+/// Menu items being built, and what clicking each one does
+#[derive(Default)]
+struct Actions(HashMap<MenuId, Action>);
+
+impl Actions {
+    fn item(&mut self, text: &str, enabled: bool, action: Action) -> MenuItem {
+        let item = MenuItem::new(text, enabled, None);
+        self.0.insert(item.id().clone(), action);
+        item
+    }
+
+    fn check(&mut self, text: &str, checked: bool, action: Action) -> CheckMenuItem {
+        let item = CheckMenuItem::new(text, true, checked, None);
+        self.0.insert(item.id().clone(), action);
+        item
     }
 }
 
 struct Tray {
     menu: Menu,
     status: MenuItem,
-    /// Speakers currently listed in the Left/Right submenus
+    /// Speakers listed in the Left/Right submenus, which [`Action::Speaker`] indexes into
     devices: Vec<String>,
-    /// Left and right, in the order of [`Config::speakers`]
-    sides: [SideMenu; 2],
-    swap: MenuItem,
-    latency: Vec<(u32, CheckMenuItem)>,
-    auto: CheckMenuItem,
-    open_config: MenuItem,
-    view_log: MenuItem,
-    quit: MenuItem,
+    /// What clicking each item in `menu` does
+    actions: HashMap<MenuId, Action>,
 }
 
 impl Tray {
     fn new() -> Tray {
-        let latency_menu = Submenu::new("Latency", true);
-        let latency: Vec<(u32, CheckMenuItem)> = LATENCIES
-            .iter()
-            .map(|&ms| {
-                let item = CheckMenuItem::new(format!("{ms} ms"), true, false, None);
-                let _ = latency_menu.append(&item);
-                (ms, item)
-            })
-            .collect();
-
-        let tray = Tray {
+        let mut tray = Tray {
             menu: Menu::new(),
             status: MenuItem::new("Status: Starting", false, None),
             devices: Vec::new(),
-            sides: [
-                SideMenu::new("Left speaker", "Test left"),
-                SideMenu::new("Right speaker", "Test right"),
-            ],
-            swap: MenuItem::new("Swap left / right", true, None),
-            latency,
-            auto: CheckMenuItem::new("Start with Windows", true, autostart::enabled(), None),
-            open_config: MenuItem::new("Open config file", true, None),
-            view_log: MenuItem::new("Open log folder", true, None),
-            quit: MenuItem::new("Exit", true, None),
+            actions: HashMap::new(),
         };
-        let [left, right] = &tray.sides;
-        let _ = tray.menu.append_items(&[
-            &tray.status,
-            &PredefinedMenuItem::separator(),
-            &left.menu,
-            &right.menu,
-            &tray.swap,
-            &left.test,
-            &right.test,
-            &PredefinedMenuItem::separator(),
-            &latency_menu,
-            &tray.auto,
-            &PredefinedMenuItem::separator(),
-            &tray.open_config,
-            &tray.view_log,
-            &PredefinedMenuItem::separator(),
-            &tray.quit,
-        ]);
+        tray.refresh();
         tray
     }
 
-    /// Re-read the config and the device list, and update the menu to match.
+    /// Rebuild the menu from the config and the device list.
     /// Runs on the UI thread, so it is timed to see whether it ever stalls the tray.
     #[tracing::instrument(level = "debug", skip_all)]
     fn refresh(&mut self) {
         let started = Instant::now();
-        let Ok(cfg) = config::load() else {
-            return;
+        let cfg = match config::load() {
+            Ok(cfg) => cfg,
+            // Keep showing the last config that loaded; the first menu has to show something
+            Err(_) if !self.actions.is_empty() => return,
+            Err(_) => Config::default(),
         };
         let hide = |n: &str| {
             [&cfg.source, &cfg.volume_endpoint]
@@ -181,101 +182,80 @@ impl Tray {
             .into_iter()
             .filter(|n| !hide(n))
             .collect();
-        if devices != self.devices {
-            self.rebuild_devices(devices);
+        let chosen = cfg.speakers().map(|s| devices::pick(&devices, s));
+
+        let mut a = Actions::default();
+        let titles = [(0, "Left speaker"), (1, "Right speaker")];
+        let [left, right] = titles.map(|(side, title)| {
+            let menu = Submenu::new(title, true);
+            for (i, name) in devices.iter().enumerate() {
+                let checked = chosen[side] == Some(i);
+                let item = a.check(&menu_text(name), checked, Action::Speaker(side, i));
+                let _ = menu.append(&item);
+            }
+            if devices.is_empty() {
+                let _ = menu.append(&MenuItem::new("(No speakers found)", false, None));
+            }
+            menu
+        });
+        let latency = Submenu::new("Latency", true);
+        for ms in LATENCIES {
+            let checked = ms == cfg.latency_ms;
+            let item = a.check(&format!("{ms} ms"), checked, Action::Latency(ms));
+            let _ = latency.append(&item);
         }
-        self.sync(&cfg);
+
+        let separator = PredefinedMenuItem::separator;
+        while self.menu.remove_at(0).is_some() {}
+        let _ = self.menu.append_items(&[
+            &self.status,
+            &separator(),
+            &left,
+            &right,
+            &a.item("Swap left / right", true, Action::Swap),
+            &a.item("Test left", chosen[0].is_some(), Action::Test(0)),
+            &a.item("Test right", chosen[1].is_some(), Action::Test(1)),
+            &separator(),
+            &latency,
+            &a.check(
+                "Start with Windows",
+                autostart::enabled(),
+                Action::Autostart,
+            ),
+            &separator(),
+            &a.item("Open config file", true, Action::OpenConfig),
+            &a.item("Open log folder", true, Action::OpenLog),
+            &separator(),
+            &a.item("Exit", true, Action::Quit),
+        ]);
+        self.actions = a.0;
+        self.devices = devices;
+
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if elapsed_ms > 200 {
             warn!(elapsed_ms, "tray refresh was slow");
         }
     }
 
-    fn rebuild_devices(&mut self, devices: Vec<String>) {
-        for side in &mut self.sides {
-            while side.menu.remove_at(0).is_some() {}
-            side.items = devices
-                .iter()
-                .map(|name| {
-                    let item = CheckMenuItem::new(menu_text(name), true, false, None);
-                    let _ = side.menu.append(&item);
-                    item
-                })
-                .collect();
-            if devices.is_empty() {
-                let _ = side
-                    .menu
-                    .append(&MenuItem::new("(No speakers found)", false, None));
-            }
-        }
-        self.devices = devices;
-    }
-
-    /// Set every check mark from the config
-    fn sync(&self, cfg: &Config) {
-        for (side, speaker) in self.sides.iter().zip(cfg.speakers()) {
-            let chosen = devices::pick(&self.devices, speaker);
-            for (i, item) in side.items.iter().enumerate() {
-                item.set_checked(chosen == Some(i));
-            }
-            side.test.set_enabled(chosen.is_some());
-        }
-        for (ms, item) in &self.latency {
-            item.set_checked(*ms == cfg.latency_ms);
-        }
-    }
-
-    fn handle(&mut self, id: &MenuId) {
-        let devices = &self.devices;
-        let speaker = self.sides.iter().enumerate().find_map(|(side, menu)| {
-            let i = menu.items.iter().position(|item| item.id() == id)?;
-            Some((side, i))
-        });
-        let test = self.sides.iter().position(|menu| menu.test.id() == id);
-        let latency = self.latency.iter().find(|(_, item)| item.id() == id);
-
-        let edited = if let Some((side, i)) = speaker {
-            edit_config(|c| choose(c, side, &devices[i], devices))
-        } else if let Some(&(ms, _)) = latency {
-            edit_config(|c| c.latency_ms = ms)
-        } else if id == self.swap.id() {
-            edit_config(|c| std::mem::swap(&mut c.left, &mut c.right))
-        } else if let Some(side) = test {
-            if let Ok(cfg) = config::load() {
-                if let Some(i) = devices::pick(devices, cfg.speakers()[side]) {
-                    engine::play_test_tone(devices[i].clone());
-                }
-            }
-            None
-        } else if id == self.auto.id() {
-            let want = self.auto.is_checked();
-            if let Err(e) = autostart::set(want) {
-                toast::show(
-                    "Failed to enable/disable start with Windows",
-                    &e.to_string(),
-                );
-                self.auto.set_checked(!want);
-            }
-            None
-        } else if id == self.open_config.id() {
-            let _ = std::process::Command::new("explorer")
-                .arg(config::config_path())
-                .spawn();
-            None
-        } else if id == self.view_log.id() {
-            let _ = std::process::Command::new("explorer")
-                .arg(config::log_dir())
-                .spawn();
-            None
-        } else {
-            None
+    /// Do what the clicked item says. Breaks when Exit was clicked.
+    fn handle(&mut self, id: &MenuId) -> ControlFlow<()> {
+        let Some(&action) = self.actions.get(id) else {
+            return ControlFlow::Continue(());
         };
-
-        match edited {
-            Some(cfg) => self.sync(&cfg),
-            // Menu clicks toggle check marks on their own; put them back
-            None => self.refresh(),
+        let devices = &self.devices;
+        match action {
+            Action::Speaker(side, i) => edit_config(|c| choose(c, side, &devices[i], devices)),
+            Action::Swap => edit_config(|c| std::mem::swap(&mut c.left, &mut c.right)),
+            Action::Latency(ms) => edit_config(|c| c.latency_ms = ms),
+            Action::Test(side) => test_tone(devices, side),
+            Action::Autostart => toggle_autostart(),
+            Action::OpenConfig => open(&config::config_path()),
+            Action::OpenLog => open(&config::log_dir()),
+            Action::Quit => return ControlFlow::Break(()),
         }
+        // Clicks toggle check marks on their own; rebuild the menu from what was saved
+        self.refresh();
+        ControlFlow::Continue(())
     }
 }
 
@@ -321,11 +301,27 @@ fn main() {
 
     let (tx, rx) = mpsc::channel();
     let status = Arc::new(Mutex::new("Starting"));
-    supervisor::spawn(tx.clone(), rx, status.clone());
+    // Set when the config or the devices change, for the message loop below to rebuild the
+    // menu. tray-icon opens the menu right on the right-click, before we hear of the click,
+    // so the menu has to be up to date before then.
+    let stale = Arc::new(AtomicBool::new(false));
+    let ui_thread = unsafe { GetCurrentThreadId() };
+    supervisor::spawn(tx.clone(), rx, status.clone(), {
+        let stale = stale.clone();
+        move || {
+            stale.store(true, Ordering::Relaxed);
+            // Wake the message loop. If the open menu's own loop takes this message, the flag
+            // is still seen on the next one.
+            unsafe {
+                let _ = PostThreadMessageW(ui_thread, WM_NULL, WPARAM(0), LPARAM(0));
+            }
+        }
+    });
 
     let mut tray = Tray::new();
-    tray.refresh();
 
+    // Tray icon events aren't used; without a handler they would pile up unread
+    TrayIconEvent::set_event_handler(Some(|_| {}));
     let _tray_icon = match TrayIconBuilder::new()
         .with_menu(Box::new(tray.menu.clone()))
         .with_tooltip(APP_NAME)
@@ -340,7 +336,6 @@ fn main() {
     };
 
     let menu_rx = MenuEvent::receiver();
-    let tray_rx = TrayIconEvent::receiver();
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -351,22 +346,14 @@ fn main() {
             tray.status
                 .set_text(format!("Status: {}", status.lock().unwrap()));
 
-            // The mouse moving onto the icon comes before any right-click, so the device
-            // list is fresh by the time the menu opens (e.g. after plugging in a speaker)
-            let mut entered = false;
-            while let Ok(ev) = tray_rx.try_recv() {
-                entered |= matches!(ev, TrayIconEvent::Enter { .. });
-            }
-            if entered {
+            if stale.swap(false, Ordering::Relaxed) {
                 tray.refresh();
             }
 
             while let Ok(ev) = menu_rx.try_recv() {
-                if ev.id == *tray.quit.id() {
+                if tray.handle(&ev.id).is_break() {
                     let _ = tx.send(supervisor::Event::Quit);
                     PostQuitMessage(0);
-                } else {
-                    tray.handle(&ev.id);
                 }
             }
         }
