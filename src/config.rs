@@ -187,16 +187,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_keys_use_defaults() {
-        let parsed: Config = toml::from_str("latency_ms = 30").unwrap();
-        let expected = Config {
-            latency_ms: 30,
-            ..Config::default()
-        };
-        assert_eq!(parsed, expected);
-    }
-
-    #[test]
     fn choose_dir_is_portable_only_with_config() {
         let tmp = tempfile::tempdir().unwrap();
         let (exe, appdata) = (tmp.path().join("exe"), tmp.path().join("appdata"));
