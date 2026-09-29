@@ -35,6 +35,9 @@ toml_edit = "0.25"
 smart-default = "0.7"
 notify = "8"
 toml-example = "0.17"
+tracing = "0.1.44"
+chrono = "0.4.45"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
 
 [profile.release]
 opt-level = 3

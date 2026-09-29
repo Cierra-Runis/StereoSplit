@@ -10,9 +10,10 @@
 //!   process to end for any reason, including a crash or being killed from Task Manager
 
 use crate::config::{self, Config};
-use crate::log;
 use anyhow::{anyhow, Context, Result};
+use std::path::Path;
 use std::sync::Mutex;
+use tracing::{error, info};
 
 use policy::IPolicyConfig;
 use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
@@ -211,7 +212,7 @@ pub fn take_over(cfg: &Config) -> Result<()> {
             }
         }
         set_default(&cable)?;
-        log("Default playback device switched to the source");
+        info!("default playback device switched to the source");
         Ok(())
     }
 }
@@ -234,7 +235,7 @@ pub fn restore(cfg: &Config) -> Result<()> {
         for id in candidates.into_iter().flatten() {
             if !id.is_empty() && id != cable && is_active(&id) {
                 set_default(&id)?;
-                log("Default playback device switched back");
+                info!("default playback device switched back");
                 *RESTORED_TO.lock().unwrap() = Some(id);
                 return Ok(());
             }
@@ -252,23 +253,27 @@ pub fn restore_from_disk() {
         return;
     };
     if let Err(e) = restore(&cfg) {
-        log(&format!("{e:#}"));
+        error!(
+            error = %format_args!("{e:#}"),
+            "failed to switch the default playback device back"
+        );
     }
 }
 
-/// Start the guard process for the current process
-pub fn spawn_guard() {
+/// Start the guard process for the current process. It logs to `log_file` too.
+pub fn spawn_guard(log_file: Option<&Path>) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let spawned = std::env::current_exe().and_then(|exe| {
-        std::process::Command::new(exe)
-            .arg("--guard")
-            .arg(std::process::id().to_string())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--guard").arg(std::process::id().to_string());
+        if let Some(f) = log_file {
+            cmd.arg(f);
+        }
+        cmd.creation_flags(CREATE_NO_WINDOW).spawn()
     });
     if let Err(e) = spawned {
-        log(&format!("Failed to start the guard process: {e}"));
+        error!(error = %e, "failed to start the guard process");
     }
 }
 

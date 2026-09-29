@@ -51,12 +51,12 @@ Right-click the tray icon and check "Start with Windows".
 | Latency                      | Buffer size. Raise it if you hear crackling, lower it for less delay          |
 | Start with Windows           | Adds or removes the startup entry for the current user                        |
 | Open config file             | Opens `config.toml` in Notepad for the advanced settings. Saving applies them |
-| View log                     | Look here when something goes wrong                                           |
+| Open log folder              | One log file per run, newest last. Look here when something goes wrong        |
 | Exit                         | Exits the program and switches the default device back to your speaker        |
 
 ## Troubleshooting
 
-**No sound at all**: Check "Status" in the tray menu and the log. If it says "Choose speakers", pick both speakers in the tray menu.
+**No sound at all**: Check "Status" in the tray menu and the newest log file. If it says "Choose speakers", pick both speakers in the tray menu.
 
 **Crackling or dropouts**: Set "Latency" in the tray menu to 50 ms.
 

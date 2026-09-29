@@ -4,15 +4,17 @@
 mod config;
 mod default_device;
 mod engine;
+mod logging;
 mod volume;
 
-use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use config::Config;
+use tracing::{error, info, warn};
 use tray_icon::menu::{
     CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
@@ -36,29 +38,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const APP_NAME: &str = "Stereo Split";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const LATENCIES: [u32; 4] = [15, 20, 30, 50];
-
-/// Append a line to stereo-split.log in the data folder
-pub fn log(msg: &str) {
-    let path = config::data_dir().join(config::LOG_FILE);
-    // Start over once the log exceeds 1 MB
-    if std::fs::metadata(&path)
-        .map(|m| m.len() > 1_000_000)
-        .unwrap_or(false)
-    {
-        let _ = std::fs::remove_file(&path);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "[{t}] {msg}");
-    }
-}
 
 fn message_box(text: &str, error: bool) {
     let flags = MB_OK
@@ -166,9 +145,10 @@ fn watch_config(tx: Sender<Event>) -> Option<notify::RecommendedWatcher> {
     match watcher {
         Ok(w) => Some(w),
         Err(e) => {
-            log(&format!(
-                "Can't watch the config file; changes made by hand need a restart: {e}"
-            ));
+            warn!(
+                error = %e,
+                "can't watch the config file; changes made by hand need a restart"
+            );
             None
         }
     }
@@ -231,7 +211,7 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                 Ok(c) => c,
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    log(&msg);
+                    error!(error = %msg, "failed to load the config");
                     set_status("Config error");
                     if shown_error.as_deref() != Some(msg.as_str()) {
                         message_box(&msg, true);
@@ -271,7 +251,10 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                     set_status("Running");
                     match default_device::take_over(&cfg) {
                         Ok(()) => managed = true,
-                        Err(e) => log(&format!("{e:#}")),
+                        Err(e) => error!(
+                            error = %format_args!("{e:#}"),
+                            "failed to switch the default playback device"
+                        ),
                     }
                     let ev = rx.recv().unwrap_or(Event::Quit);
                     // Dropping the streams joins their threads, so no more failures
@@ -281,7 +264,7 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                         Event::Quit => false,
                         Event::ConfigChanged => debounce(&rx),
                         Event::Failed => {
-                            log("Audio interrupted, reconnecting in 2 seconds");
+                            warn!(retry_in_secs = 2, "audio interrupted, reconnecting");
                             set_status("Reconnecting");
                             wait(&rx, Some(Duration::from_secs(2)))
                         }
@@ -289,7 +272,7 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
-                    log(&msg);
+                    error!(error = %msg, retry_in_secs = 3, "failed to start the engine");
                     set_status("Failed to start (see log)");
                     // Nothing is playing through the source now, so let Windows play
                     // straight to a speaker until the engine is back
@@ -320,7 +303,10 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
 fn release(cfg: &Config, managed: &mut bool) {
     if std::mem::take(managed) {
         if let Err(e) = default_device::restore(cfg) {
-            log(&format!("{e:#}"));
+            error!(
+                error = %format_args!("{e:#}"),
+                "failed to switch the default playback device back"
+            );
         }
     }
 }
@@ -409,7 +395,7 @@ impl Tray {
             latency,
             auto: CheckMenuItem::new("Start with Windows", true, autostart_enabled(), None),
             open_config: MenuItem::new("Open config file", true, None),
-            view_log: MenuItem::new("View log", true, None),
+            view_log: MenuItem::new("Open log folder", true, None),
             quit: MenuItem::new("Exit", true, None),
         };
         let _ = tray.menu.append_items(&[
@@ -432,8 +418,11 @@ impl Tray {
         tray
     }
 
-    /// Re-read the config and the device list, and update the menu to match
+    /// Re-read the config and the device list, and update the menu to match.
+    /// Runs on the UI thread, so it is timed to see whether it ever stalls the tray.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn refresh(&mut self) {
+        let started = Instant::now();
         let Ok(cfg) = config::load() else {
             return;
         };
@@ -451,6 +440,10 @@ impl Tray {
             self.rebuild_devices(devices);
         }
         self.sync(&cfg);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms > 200 {
+            warn!(elapsed_ms, "tray refresh was slow");
+        }
     }
 
     fn rebuild_devices(&mut self, devices: Vec<String>) {
@@ -542,8 +535,8 @@ impl Tray {
                 .spawn();
             None
         } else if id == self.view_log.id() {
-            let _ = std::process::Command::new("notepad")
-                .arg(config::data_dir().join(config::LOG_FILE))
+            let _ = std::process::Command::new("explorer")
+                .arg(config::log_dir())
                 .spawn();
             None
         } else {
@@ -577,7 +570,7 @@ unsafe extern "system" fn session_wndproc(
         WM_QUERYENDSESSION => LRESULT(1),
         WM_ENDSESSION => {
             if wparam.0 != 0 {
-                log("Windows is logging off or shutting down");
+                info!("windows is logging off or shutting down");
                 default_device::restore_from_disk();
             }
             LRESULT(0)
@@ -616,7 +609,7 @@ fn create_session_window() {
             None,
         );
         if let Err(e) = created {
-            log(&format!("Failed to create the session window: {e}"));
+            error!(error = %e, "failed to create the session window");
         }
     }
 }
@@ -628,6 +621,8 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--guard") {
+        // Append to the main process's log file rather than start one per guard
+        logging::init(args.get(3).map(PathBuf::from));
         if let Some(pid) = args.get(2).and_then(|s| s.parse().ok()) {
             default_device::run_guard(pid);
         }
@@ -641,20 +636,22 @@ fn main() {
         );
         return;
     }
-    log("Program started");
+    // Only now, so a second copy that exits right away leaves no log file behind
+    let log_file = logging::init(None);
+    info!(version = env!("CARGO_PKG_VERSION"), "program started");
 
     // Never leave the PC silent: switch the default device back on a panic, restart
     // automatically after a crash, and let a guard process clean up if this one is killed
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log(&format!("Panic: {info}"));
+        error!(panic = %info, "panic");
         default_device::restore_from_disk();
         default_hook(info);
     }));
     unsafe {
         let _ = RegisterApplicationRestart(PCWSTR::null(), RESTART_NO_REBOOT);
     }
-    default_device::spawn_guard();
+    default_device::spawn_guard(log_file.as_deref());
     create_session_window();
 
     let (tx, rx) = mpsc::channel();
@@ -709,7 +706,7 @@ fn main() {
             }
         }
     }
-    log("Program exited");
+    info!("program exited");
     // Give the audio threads a moment to wind down, then hand the default device back
     std::thread::sleep(Duration::from_millis(300));
     default_device::restore_from_disk();

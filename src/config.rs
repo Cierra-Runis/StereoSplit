@@ -9,7 +9,8 @@ use toml_example::TomlExample;
 /// Name of the data folder, both next to the exe (portable) and under %LOCALAPPDATA%
 const APP_DIR: &str = "StereoSplit";
 pub const CONFIG_FILE: &str = "config.toml";
-pub const LOG_FILE: &str = "stereo-split.log";
+/// Folder in the data folder holding one log file per run
+pub const LOG_DIR: &str = "logs";
 pub const RESTORE_FILE: &str = "restore-device.txt";
 
 // The doc comments below are also the comments in a new config file (via `TomlExample`),
@@ -95,7 +96,7 @@ fn migrate_legacy(exe_dir: &Path) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    for name in [CONFIG_FILE, LOG_FILE, RESTORE_FILE] {
+    for name in [CONFIG_FILE, RESTORE_FILE] {
         let old = exe_dir.join(name);
         if old.exists() {
             let _ = std::fs::rename(&old, dir.join(name));
@@ -103,7 +104,7 @@ fn migrate_legacy(exe_dir: &Path) {
     }
 }
 
-/// Folder holding the config file, the log and the saved default device. Debug builds always
+/// Folder holding the config file, the logs and the saved default device. Debug builds always
 /// use the one next to the exe (in target/), so they never touch an installed copy's data.
 pub fn data_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -123,6 +124,10 @@ pub fn data_dir() -> &'static Path {
 
 pub fn config_path() -> PathBuf {
     data_dir().join(CONFIG_FILE)
+}
+
+pub fn log_dir() -> PathBuf {
+    data_dir().join(LOG_DIR)
 }
 
 /// Load the config; if the file does not exist, write one with the defaults.
@@ -233,15 +238,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let exe = tmp.path();
         fs::write(exe.join(CONFIG_FILE), "config").unwrap();
-        fs::write(exe.join(LOG_FILE), "log").unwrap();
+        fs::write(exe.join(RESTORE_FILE), "device").unwrap();
 
         migrate_legacy(exe);
 
         let dir = exe.join(APP_DIR);
         assert_eq!(read(dir.join(CONFIG_FILE)), "config");
-        assert_eq!(read(dir.join(LOG_FILE)), "log");
+        assert_eq!(read(dir.join(RESTORE_FILE)), "device");
         assert!(!exe.join(CONFIG_FILE).exists());
-        assert!(!exe.join(LOG_FILE).exists());
+        assert!(!exe.join(RESTORE_FILE).exists());
     }
 
     #[test]

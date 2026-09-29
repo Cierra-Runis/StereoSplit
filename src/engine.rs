@@ -22,6 +22,7 @@ use rubato::{
 };
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{error, info};
 
 /// Source frames the resampler consumes per step
 const CHUNK_IN: usize = 128;
@@ -57,6 +58,7 @@ fn find_in(devs: impl Iterator<Item = cpal::Device>, pat: &str) -> Option<cpal::
 }
 
 /// Names of all playback devices
+#[tracing::instrument(level = "debug")]
 pub fn output_device_names() -> Vec<String> {
     cpal::default_host()
         .output_devices()
@@ -207,10 +209,10 @@ impl Feeder {
     }
 }
 
-/// Output stream for one speaker
+/// Output stream for one speaker. `side` is "left" or "right".
 fn build_output(
     dev: &cpal::Device,
-    label: &str,
+    side: &'static str,
     in_rate: u32,
     mut cons: HeapCons<f32>,
     target: usize,
@@ -233,9 +235,7 @@ fn build_output(
     let mut drift = DriftControl::new(target);
     let mut primed = false;
     let mut smooth = gain.get();
-    crate::log(&format!(
-        "{label} \"{name}\": {in_rate} Hz -> {out_rate} Hz"
-    ));
+    info!(side, device = %name, in_rate, out_rate, "output resampling");
 
     let stream = dev.build_output_stream(
         &cfg,
@@ -280,7 +280,7 @@ fn build_output(
             }
         },
         move |e| {
-            crate::log(&format!("Output stream error: {e}"));
+            error!(side, error = %e, "output stream error");
             on_error();
         },
         None,
@@ -294,7 +294,7 @@ fn build_output(
 pub fn play_test_tone(device: String) {
     std::thread::spawn(move || {
         if let Err(e) = test_tone(&device) {
-            crate::log(&format!("Test tone on \"{device}\" failed: {e:#}"));
+            error!(device = %device, error = %format_args!("{e:#}"), "test tone failed");
         }
     });
 }
@@ -325,7 +325,7 @@ fn test_tone(device: &str) -> Result<()> {
                 n = n.saturating_add(1);
             }
         },
-        |e| crate::log(&format!("Test tone stream error: {e}")),
+        |e| error!(error = %e, "test tone stream error"),
         None,
     )?;
     stream.play()?;
@@ -334,6 +334,7 @@ fn test_tone(device: &str) -> Result<()> {
 }
 
 impl Engine {
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn start(cfg: &Config, gain: Gain, on_error: OnError) -> Result<Engine> {
         let host = cpal::default_host();
 
@@ -383,7 +384,7 @@ impl Engine {
                 }
             },
             move |e| {
-                crate::log(&format!("Input stream error: {e}"));
+                error!(error = %e, "input stream error");
                 on_input_error();
             },
             None,
@@ -391,7 +392,7 @@ impl Engine {
 
         let left = build_output(
             &left_dev,
-            "Left speaker",
+            "left",
             sample_rate,
             lc,
             target,
@@ -400,7 +401,7 @@ impl Engine {
         )?;
         let right = build_output(
             &right_dev,
-            "Right speaker",
+            "right",
             sample_rate,
             rc,
             target,
@@ -411,12 +412,15 @@ impl Engine {
             .play()
             .map_err(|e| anyhow!("Failed to start capturing sound: {e}"))?;
 
-        crate::log(&format!(
-            "Started ({mode}): {in_name} -> left \"{}\" / right \"{}\", {sample_rate} Hz, buffer {} ms",
-            left_dev.name().unwrap_or_default(),
-            right_dev.name().unwrap_or_default(),
-            cfg.latency_ms
-        ));
+        info!(
+            mode,
+            input = %in_name,
+            left = %left_dev.name().unwrap_or_default(),
+            right = %right_dev.name().unwrap_or_default(),
+            sample_rate,
+            latency_ms = cfg.latency_ms,
+            "engine started"
+        );
 
         Ok(Engine {
             _input: input,

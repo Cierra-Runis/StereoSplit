@@ -6,10 +6,10 @@
 //! keys control both speakers.
 
 use crate::default_device::find_render_device;
-use crate::log;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{info, warn};
 
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::System::Com::{CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
@@ -49,15 +49,16 @@ pub fn spawn_watcher(pattern: String, gain: Gain, stop: Arc<AtomicBool>) {
             if endpoint.is_none() {
                 match find_endpoint(&pattern) {
                     Ok(Some(ep)) => {
-                        log(&format!("Volume follow: found device \"{pattern}\""));
+                        info!(device = %pattern, "volume follow: device found");
                         endpoint = Some(ep);
                         warned = false;
                     }
                     _ => {
                         if !warned {
-                            log(&format!(
-                                "Volume follow: playback device \"{pattern}\" not found, using 100% for now"
-                            ));
+                            warn!(
+                                device = %pattern,
+                                "volume follow: playback device not found, using 100% for now"
+                            );
                             warned = true;
                         }
                         gain.set(1.0);
