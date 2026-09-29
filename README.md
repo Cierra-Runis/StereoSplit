@@ -42,19 +42,17 @@ Right-click the tray icon and check "Start with Windows".
 
 ## Tray menu
 
-| Item                           | What it does                                                                  |
-| ------------------------------ | ----------------------------------------------------------------------------- |
-| Status                         | Shows Running, Choose speakers, Reconnecting, Config error, etc.              |
-| Left speaker / Right speaker   | Pick the speaker for each channel. The list refreshes when you plug one in    |
-| Swap left / right              | Swaps the two speakers                                                        |
-| Test left / Test right         | Plays a short beep on that speaker                                            |
-| Latency                        | Buffer size. Raise it if you hear crackling, lower it for less delay          |
-| Follow Windows volume keys     | Whether the volume keys and taskbar slider control both speakers              |
-| Manage default playback device | Switch the default device to CABLE Input while running, and back on exit      |
-| Start with Windows             | Adds or removes the startup entry for the current user                        |
-| Open config file               | Opens `config.toml` in Notepad for the advanced settings. Saving applies them |
-| View log                       | Look here when something goes wrong                                           |
-| Exit                           | Exits the program and switches the default device back to your speaker        |
+| Item                         | What it does                                                                  |
+| ---------------------------- | ----------------------------------------------------------------------------- |
+| Status                       | Shows Running, Choose speakers, Reconnecting, Config error, etc.              |
+| Left speaker / Right speaker | Pick the speaker for each channel. The list refreshes when you plug one in    |
+| Swap left / right            | Swaps the two speakers                                                        |
+| Test left / Test right       | Plays a short beep on that speaker                                            |
+| Latency                      | Buffer size. Raise it if you hear crackling, lower it for less delay          |
+| Start with Windows           | Adds or removes the startup entry for the current user                        |
+| Open config file             | Opens `config.toml` in Notepad for the advanced settings. Saving applies them |
+| View log                     | Look here when something goes wrong                                           |
+| Exit                         | Exits the program and switches the default device back to your speaker        |
 
 ## Troubleshooting
 
@@ -64,13 +62,9 @@ Right-click the tray icon and check "Start with Windows".
 
 **Left and right are swapped**: Choose "Swap left / right" in the tray menu.
 
-**Volume keys do nothing**: Make sure "Follow Windows volume keys" is checked and that `volume_endpoint` in `config.toml` matches CABLE Input.
-
-**Volume changes are too steep (one step drops it a lot)**: Windows is already applying the volume to the loopback audio, and the program applies it a second time. Uncheck "Follow Windows volume keys".
+**Volume keys do nothing**: Make sure `volume_endpoint` in `config.toml` matches CABLE Input.
 
 **The tray shows "microphone in use"**: Open `config.toml` and make sure `source = "CABLE Input"` (older versions defaulted to CABLE Output).
-
-**I want to pick the default playback device myself**: Uncheck "Manage default playback device". The program will then leave the default device alone, and you'll need to set CABLE Input as the default yourself.
 
 **Going back to normal**: Just exit the program; the default playback device switches back to the speaker you used before.
 

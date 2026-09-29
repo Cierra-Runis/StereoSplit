@@ -38,7 +38,7 @@ unsafe fn find_endpoint(pattern: &str) -> windows::core::Result<Option<IAudioEnd
 }
 
 /// Background thread: reads the volume every 30 ms and writes it to `gain`.
-/// When `enabled` is false the gain is fixed at 1. The thread exits once `stop` is set.
+/// The thread exits once `stop` is set.
 pub fn spawn_watcher(pattern: String, gain: Gain, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
