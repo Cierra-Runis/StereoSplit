@@ -20,9 +20,10 @@ use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
     Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction,
 };
+use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::{error, info};
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
 /// Source frames the resampler consumes per step
 const CHUNK_IN: usize = 128;
@@ -30,10 +31,52 @@ const CHUNK_IN: usize = 128;
 /// Called from an audio thread when a stream fails (e.g. a speaker was unplugged)
 pub type OnError = Arc<dyn Fn() + Send + Sync>;
 
-pub struct Engine {
+struct Engine {
     _input: Stream,
     _left: Stream,
     _right: Stream,
+}
+
+/// A running engine, which lives on a thread of its own.
+///
+/// Dropping this tells the engine to stop, without waiting for it: stopping joins cpal's
+/// stream threads, which could hang forever on a wedged driver (e.g. a USB speaker pulled out
+/// mid-call), and the caller must be able to go on reconnecting regardless. So `on_error` may
+/// still be called for a while after this is dropped.
+pub struct Running {
+    _stop: Sender<()>,
+}
+
+/// Start the engine on a thread of its own, returning once it is playing (or failed to start).
+/// cpal's streams can't be sent to another thread, so the thread that builds them also drops them.
+pub fn spawn(cfg: Config, gain: Gain, on_error: OnError) -> Result<Running> {
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("engine".into())
+        .spawn(move || {
+            let engine = match Engine::start(&cfg, gain, on_error) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = started_tx.send(Err(e));
+                    return;
+                }
+            };
+            let _ = started_tx.send(Ok(()));
+            // Returns once the `Running` handle is dropped
+            let _ = stop_rx.recv();
+            let t = Instant::now();
+            drop(engine);
+            let elapsed_ms = t.elapsed().as_millis() as u64;
+            if elapsed_ms > 1000 {
+                warn!(elapsed_ms, "engine was slow to stop");
+            }
+        })
+        .context("Failed to start the audio thread")?;
+    started_rx
+        .recv()
+        .unwrap_or_else(|_| Err(anyhow!("The audio thread crashed while starting")))?;
+    Ok(Running { _stop: stop_tx })
 }
 
 /// Index of the device matching `pat`: an exact (case-insensitive) name match wins,
@@ -347,7 +390,7 @@ fn test_tone(device: &str) -> Result<()> {
 
 impl Engine {
     #[tracing::instrument(level = "info", skip_all)]
-    pub fn start(cfg: &Config, gain: Gain, on_error: OnError) -> Result<Engine> {
+    fn start(cfg: &Config, gain: Gain, on_error: OnError) -> Result<Engine> {
         let host = cpal::default_host();
 
         let source = find_source(&host, &cfg.source)?;

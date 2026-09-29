@@ -73,8 +73,9 @@ fn tray_icon() -> Icon {
 enum Event {
     /// Exit was chosen from the tray menu
     Quit,
-    /// A running audio stream failed (e.g. a speaker was unplugged)
-    Failed,
+    /// A running audio stream failed (e.g. a speaker was unplugged). Holds the generation of
+    /// the engine it came from, since a stopped engine can still report failures for a while.
+    Failed(u64),
     /// config.toml was saved, from the tray menu or by hand
     ConfigChanged,
 }
@@ -143,7 +144,7 @@ fn wait(rx: &Receiver<Event>, timeout: Option<Duration>) -> bool {
         match ev {
             Event::Quit => return false,
             Event::ConfigChanged => return debounce(rx),
-            Event::Failed => {}
+            Event::Failed(_) => {}
         }
     }
 }
@@ -160,9 +161,8 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
         let mut managed = false;
 
         let _watcher = watch_config(tx.clone());
-        let on_error: engine::OnError = Arc::new(move || {
-            let _ = tx.send(Event::Failed);
-        });
+        // Counts engine starts, so failures from an earlier engine can be told apart
+        let mut generation = 0u64;
 
         loop {
             let cfg = match config::load() {
@@ -203,7 +203,16 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
             let gain = volume::Gain::new(1.0);
             volume::spawn_watcher(cfg.volume_endpoint.clone(), gain.clone(), vol_stop.clone());
 
-            let go_on = match engine::Engine::start(&cfg, gain, on_error.clone()) {
+            generation += 1;
+            let on_error: engine::OnError = {
+                let tx = tx.clone();
+                let generation = generation;
+                Arc::new(move || {
+                    let _ = tx.send(Event::Failed(generation));
+                })
+            };
+
+            let go_on = match engine::spawn(cfg.clone(), gain, on_error) {
                 Ok(engine) => {
                     shown_error = None;
                     set_status("Running");
@@ -214,14 +223,20 @@ fn spawn_supervisor(tx: Sender<Event>, rx: Receiver<Event>, status: Arc<Mutex<St
                             "failed to switch the default playback device"
                         ),
                     }
-                    let ev = rx.recv().unwrap_or(Event::Quit);
-                    // Dropping the streams joins their threads, so no more failures
-                    // can arrive from this engine
+                    let ev = loop {
+                        match rx.recv() {
+                            // From an engine that was already stopped
+                            Ok(Event::Failed(g)) if g != generation => {}
+                            Ok(ev) => break ev,
+                            Err(_) => break Event::Quit,
+                        }
+                    };
+                    // Stops the engine without waiting for it (see `engine::Running`)
                     drop(engine);
                     match ev {
                         Event::Quit => false,
                         Event::ConfigChanged => debounce(&rx),
-                        Event::Failed => {
+                        Event::Failed(_) => {
                             warn!(retry_in_secs = 2, "audio interrupted, reconnecting");
                             set_status("Reconnecting");
                             wait(&rx, Some(Duration::from_secs(2)))
