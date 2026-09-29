@@ -42,17 +42,17 @@ Right-click the tray icon and check "Start with Windows".
 
 ## Tray menu
 
-| Item                         | What it does                                                                  |
-| ---------------------------- | ----------------------------------------------------------------------------- |
-| Status                       | Shows Running, Choose speakers, Reconnecting, Config error, etc.              |
-| Left speaker / Right speaker | Pick the speaker for each channel. The list refreshes when you plug one in    |
-| Swap left / right            | Swaps the two speakers                                                        |
-| Test left / Test right       | Plays a short beep on that speaker                                            |
-| Latency                      | Buffer size. Raise it if you hear crackling, lower it for less delay          |
-| Start with Windows           | Adds or removes the startup entry for the current user                        |
-| Open config file             | Opens `config.toml` in Notepad for the advanced settings. Saving applies them |
-| Open log folder              | One log file per run, newest last. Look here when something goes wrong        |
-| Exit                         | Exits the program and switches the default device back to your speaker        |
+| Item                         | What it does                                                               |
+| ---------------------------- | -------------------------------------------------------------------------- |
+| Status                       | Shows Running, Choose speakers, Reconnecting, Config error, etc.           |
+| Left speaker / Right speaker | Pick the speaker for each channel. The list refreshes when you plug one in |
+| Swap left / right            | Swaps the two speakers                                                     |
+| Test left / Test right       | Plays a short beep on that speaker                                         |
+| Latency                      | Buffer size. Raise it if you hear crackling, lower it for less delay       |
+| Start with Windows           | Adds or removes the startup entry for the current user                     |
+| Open config file             | Opens `config.toml` for the advanced settings. Saving applies them         |
+| Open log folder              | One log file per run, newest last. Look here when something goes wrong     |
+| Exit                         | Exits the program and switches the default device back to your speaker     |
 
 ## Troubleshooting
 
