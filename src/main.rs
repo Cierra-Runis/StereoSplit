@@ -6,6 +6,7 @@ mod config;
 mod default_device;
 mod devices;
 mod engine;
+mod latency;
 mod logging;
 mod meter;
 mod session;
@@ -42,7 +43,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Both defined in build.rs, which also writes them into the exe's resources
 const APP_NAME: &str = env!("APP_NAME");
 const ICON_RESOURCE: &str = env!("ICON_RESOURCE");
-const LATENCIES: [u32; 4] = [15, 20, 30, 50];
+/// Latency menu, in ms; 0 is automatic
+const LATENCIES: [u32; 5] = [0, 15, 20, 30, 50];
 
 /// Tray icon (left half blue, right half orange, for the left and right channels), embedded
 /// by build.rs from assets/icon/icon.ico at the size the tray uses on this screen
@@ -202,7 +204,11 @@ impl Tray {
         let latency = Submenu::new("Latency", true);
         for ms in LATENCIES {
             let checked = ms == cfg.latency_ms;
-            let item = a.check(&format!("{ms} ms"), checked, Action::Latency(ms));
+            let text = match ms {
+                0 => "Auto".to_string(),
+                ms => format!("{ms} ms"),
+            };
+            let item = a.check(&text, checked, Action::Latency(ms));
             let _ = latency.append(&item);
         }
 

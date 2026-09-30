@@ -31,9 +31,10 @@ pub struct Config {
     /// Speaker for the right channel
     pub right: String,
 
-    /// Buffer latency in milliseconds. Raise to 50 if you hear crackling or dropouts;
-    /// try 15 for less delay.
-    #[default(20)]
+    /// Buffer latency in milliseconds, or 0 for automatic: the lowest that doesn't crackle,
+    /// worked out all the time from how the devices deliver and take the sound. A fixed value
+    /// below that crackles now and then.
+    #[default(0)]
     pub latency_ms: u32,
 
     /// Where to capture sound from: VB-CABLE's playback side (reads what it is playing directly,

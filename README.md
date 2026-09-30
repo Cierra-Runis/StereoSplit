@@ -48,7 +48,7 @@ Right-click the tray icon and check "Start with Windows".
 | Left speaker / Right speaker | Pick the speaker for each channel. The list refreshes when you plug one in |
 | Swap left / right            | Swaps the two speakers                                                     |
 | Test left / Test right       | Plays a short beep on that speaker                                         |
-| Latency                      | Buffer size. Raise it if you hear crackling, lower it for less delay       |
+| Latency                      | Auto (the default) keeps it as low as it can go without crackling          |
 | Start with Windows           | Adds or removes the startup entry for the current user                     |
 | Open config file             | Opens `config.toml` for the advanced settings. Saving applies them         |
 | Open log folder              | One log file per run, newest last. Look here when something goes wrong     |
@@ -58,7 +58,7 @@ Right-click the tray icon and check "Start with Windows".
 
 **No sound at all**: Check "Status" in the tray menu and the newest log file. If it says "Choose speakers", pick both speakers in the tray menu.
 
-**Crackling or dropouts**: Set "Latency" in the tray menu to 50 ms. While it crackles, the log gets an `audio dropouts` line every 10 seconds, showing which speaker ran dry and how late the sound arrived.
+**Crackling or dropouts**: Make sure "Latency" in the tray menu is set to "Auto"; if it still crackles, set it to 50 ms. While it crackles, the log gets `audio dropouts` lines showing which speaker ran dry and how late the sound arrived, and in Auto the `latency set` lines show the delay it settled on.
 
 **Left and right are swapped**: Choose "Swap left / right" in the tray menu.
 

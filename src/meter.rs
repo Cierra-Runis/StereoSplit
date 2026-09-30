@@ -74,6 +74,16 @@ impl Meter {
         self.kind
     }
 
+    /// Time since the last callback started; zero before the first
+    pub fn since_last(&self) -> Duration {
+        let last = self.last_us.load(Relaxed);
+        if last == u64::MAX {
+            return Duration::ZERO;
+        }
+        let now = saturate(self.epoch.elapsed().as_micros()) as u64;
+        Duration::from_micros(now.saturating_sub(last))
+    }
+
     /// Call at the start of every data callback, with the number of frames it passes at `rate`
     pub fn callback(&self, frames: usize, rate: u32) {
         let now = saturate(self.epoch.elapsed().as_micros()) as u64;
@@ -129,17 +139,17 @@ impl Meter {
 }
 
 /// What a [`Meter`] counted over one window
-#[derive(Debug, PartialEq)]
-struct Stats {
-    kind: StreamKind,
-    callbacks: u32,
-    gap_max_us: u32,
-    block_max_us: u32,
-    xruns: u32,
-    dry: u32,
-    skips: u32,
-    fill_min_us: Option<u32>,
-    drift_ppm: Option<(i32, i32)>,
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stats {
+    pub kind: StreamKind,
+    pub callbacks: u32,
+    pub gap_max_us: u32,
+    pub block_max_us: u32,
+    pub xruns: u32,
+    pub dry: u32,
+    pub skips: u32,
+    pub fill_min_us: Option<u32>,
+    pub drift_ppm: Option<(i32, i32)>,
 }
 
 impl Stats {
@@ -175,14 +185,18 @@ impl fmt::Display for Stats {
     }
 }
 
-/// Logs a set of meters every [`WINDOW`] on its own thread, until dropped
+/// Logs a set of meters every [`WINDOW`] on its own thread, and hands what they counted to
+/// `on_window`, until dropped
 pub struct Reporter {
     /// Never sent on: dropping it disconnects the channel, which ends the thread
     _stop: Sender<()>,
 }
 
 impl Reporter {
-    pub fn start(meters: Vec<Arc<Meter>>) -> Reporter {
+    pub fn start(
+        meters: Vec<Arc<Meter>>,
+        mut on_window: impl FnMut(&[Stats]) + Send + 'static,
+    ) -> Reporter {
         let (stop, rx) = mpsc::channel::<()>();
         let spawned = std::thread::Builder::new()
             .name("meter".into())
@@ -201,6 +215,7 @@ impl Reporter {
                     } else {
                         debug!("audio: {line}");
                     }
+                    on_window(&stats);
                 }
             });
         if let Err(e) = spawned {
