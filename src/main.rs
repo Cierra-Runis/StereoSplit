@@ -9,6 +9,7 @@ mod engine;
 mod latency;
 mod logging;
 mod meter;
+mod output;
 mod session;
 mod supervisor;
 mod toast;

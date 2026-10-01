@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::devices;
 use crate::latency::{self, AutoLatency};
 use crate::meter::{Meter, Reporter, Stats};
+use crate::output::{self, Output};
 use crate::volume::Gain;
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+use windows::Win32::Media::Audio::AUDCLNT_E_DEVICE_INVALIDATED;
 
 /// Source frames the resampler consumes per step
 /// (a speaker needs this much buffered on top of what it plays in one callback, so it is kept
@@ -60,18 +62,19 @@ impl std::fmt::Display for StreamKind {
 pub type OnError = Arc<dyn Fn(StreamKind) + Send + Sync>;
 
 pub struct Engine {
-    streams: Vec<Stream>,
+    input: Option<Stream>,
+    outputs: Vec<Output>,
     /// Logs how the streams are doing, until the engine is dropped
     _reporter: Reporter,
 }
 
-/// Dropping the engine stops it without waiting for it: dropping a stream joins cpal's stream
-/// thread, which could hang forever on a wedged driver (e.g. a USB speaker pulled out
-/// mid-call), and the caller must be able to go on reconnecting regardless. So `on_error` may
-/// still be called for a while after the engine is dropped.
+/// Dropping the engine stops it without waiting for it: dropping a stream joins its thread,
+/// which could hang forever on a wedged driver (e.g. a USB speaker pulled out mid-call), and the
+/// caller must be able to go on reconnecting regardless. So `on_error` may still be called for
+/// a while after the engine is dropped.
 impl Drop for Engine {
     fn drop(&mut self) {
-        let streams = std::mem::take(&mut self.streams);
+        let streams = (self.input.take(), std::mem::take(&mut self.outputs));
         // If the thread can't be started, the streams are dropped right here instead
         let _ = std::thread::Builder::new()
             .name("engine-stop".into())
@@ -440,19 +443,20 @@ const OUT_LAT_SMOOTHING: f64 = 0.005;
 /// the speakers 20 ms short at first, so they ran dry over and over and took 20 s to get there
 const OUT_LAT_SETTLE: u32 = 10;
 
-/// Output stream for the speaker of `meter`'s side
+/// Output stream for the speaker of `meter`'s side, on the playback device matching `pattern`
 fn build_output(
-    dev: &cpal::Device,
+    pattern: &str,
     in_rate: u32,
     mut cons: HeapCons<f32>,
     shared: Arc<Shared>,
     gain: Gain,
     meter: Arc<Meter>,
     on_error: OnError,
-) -> Result<Stream> {
-    let config = f32_config(dev, true)?;
-    let out_rate = config.sample_rate;
-    let channels = config.channels as usize;
+) -> Result<Output> {
+    let mut output = Output::open(pattern)?;
+    let format = output.format().clone();
+    let out_rate = format.rate;
+    let channels = format.channels;
     let mut feeder = Feeder::new(in_rate, out_rate)?;
     let mut drift = DriftControl::new();
     let mut primed = false;
@@ -461,92 +465,106 @@ fn build_output(
     let mut callbacks = 0u32;
     let side = meter.kind();
     let slot = (side == StreamKind::Right) as usize;
-    let device = device_name(dev).unwrap_or_default();
-    info!(%side, device, in_rate, out_rate, "output resampling");
+    info!(
+        %side,
+        device = format.name,
+        in_rate,
+        out_rate,
+        period_ms = format.period as f32 * 1000.0 / out_rate as f32,
+        "output"
+    );
 
-    let errors = on_stream_error(meter.clone(), on_error);
-    let stream = dev.build_output_stream(
-        config,
-        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
-            let frames = data.len() / channels;
-            meter.callback(frames, out_rate);
-            let tgt = gain.get();
-
-            // When the first frame written now will be heard, and how long that is from now
-            let ts = info.timestamp();
-            let playback = ticks(ts.playback);
-            let out_lat = ts.playback.duration_since(ts.callback).as_secs_f64();
-            if callbacks < OUT_LAT_SETTLE {
-                callbacks += 1;
+    let errors = {
+        move |e: anyhow::Error| {
+            let gone = e
+                .downcast_ref::<windows::core::Error>()
+                .is_some_and(|e| e.code() == AUDCLNT_E_DEVICE_INVALIDATED);
+            if gone {
+                warn!(%side, "device disconnected");
             } else {
-                let avg = out_lat_avg.map_or(out_lat, |a| a + (out_lat - a) * OUT_LAT_SMOOTHING);
-                out_lat_avg = Some(avg);
-                shared.out_lat_us[slot].store(((avg * 1e6) as u32).max(1), Ordering::Relaxed);
+                error!(%side, error = %format_args!("{e:#}"), "stream error");
             }
-            let Some(goal) = shared.goal(in_rate) else {
-                data.fill(0.0);
-                return;
-            };
+            on_error(side);
+        }
+    };
+    let data = move |data: &mut [f32], timing: &output::Timing| {
+        let frames = data.len() / channels;
+        meter.callback(frames, out_rate);
+        if timing.underrun {
+            meter.xrun();
+        }
+        let tgt = gain.get();
 
-            // Severe backlog (e.g. after a system stall) -> start over at the goal
-            if primed && cons.occupied_len() as f64 > goal * in_rate as f64 * 3.0 {
-                primed = false;
-                meter.skip();
-            }
-            // On startup or after running dry, wait until the oldest sound buffered is as old
-            // as the goal, and skip what is older, so both speakers start out together. The
-            // block also needs to be buffered (if input stopped, the sound is old but not there).
-            if !primed {
-                feeder.reset();
-                let delay = shared.clock.delay(feeder.next_frame(), playback, in_rate);
-                let block = frames * in_rate as usize / out_rate as usize + CHUNK_IN;
-                match delay {
-                    Some(delay) if delay >= goal && cons.occupied_len() >= block => {
-                        let excess = ((delay - goal) * in_rate as f64) as usize;
-                        let spare = cons.occupied_len() - block;
-                        let skipped = feeder.skip(&mut cons, excess.min(spare));
-                        meter.started(delay - goal - skipped as f64 / in_rate as f64);
-                        drift.start(goal);
-                        primed = true;
-                    }
-                    _ => {
-                        data.fill(0.0);
-                        return;
-                    }
+        // When the first frame written now will be heard, and how long that is from now
+        let (playback, out_lat) = (timing.playback, timing.out_lat);
+        if callbacks < OUT_LAT_SETTLE {
+            callbacks += 1;
+        } else {
+            let avg = out_lat_avg.map_or(out_lat, |a| a + (out_lat - a) * OUT_LAT_SMOOTHING);
+            out_lat_avg = Some(avg);
+            shared.out_lat_us[slot].store(((avg * 1e6) as u32).max(1), Ordering::Relaxed);
+        }
+        let Some(goal) = shared.goal(in_rate) else {
+            data.fill(0.0);
+            return;
+        };
+
+        // Severe backlog (e.g. after a system stall) -> start over at the goal
+        if primed && cons.occupied_len() as f64 > goal * in_rate as f64 * 3.0 {
+            primed = false;
+            meter.skip();
+        }
+        // On startup or after running dry, wait until the oldest sound buffered is as old
+        // as the goal, and skip what is older, so both speakers start out together. The
+        // block also needs to be buffered (if input stopped, the sound is old but not there).
+        if !primed {
+            feeder.reset();
+            let delay = shared.clock.delay(feeder.next_frame(), playback, in_rate);
+            let block = frames * in_rate as usize / out_rate as usize + CHUNK_IN;
+            match delay {
+                Some(delay) if delay >= goal && cons.occupied_len() >= block => {
+                    let excess = ((delay - goal) * in_rate as f64) as usize;
+                    let spare = cons.occupied_len() - block;
+                    let skipped = feeder.skip(&mut cons, excess.min(spare));
+                    meter.started(delay - goal - skipped as f64 / in_rate as f64);
+                    drift.start(goal);
+                    primed = true;
+                }
+                _ => {
+                    data.fill(0.0);
+                    return;
                 }
             }
+        }
 
-            let Some(delay) = shared.clock.delay(feeder.next_frame(), playback, in_rate) else {
-                data.fill(0.0);
-                return;
-            };
-            let rel = drift.update(delay, goal, frames as f64 / out_rate as f64);
-            meter.output(delay, out_lat, rel);
-            feeder.set_relative_ratio(rel);
+        let Some(delay) = shared.clock.delay(feeder.next_frame(), playback, in_rate) else {
+            data.fill(0.0);
+            return;
+        };
+        let rel = drift.update(delay, goal, frames as f64 / out_rate as f64);
+        meter.output(delay, out_lat, rel);
+        feeder.set_relative_ratio(rel);
 
-            for frame in data.chunks_mut(channels) {
-                // Ramp the gain smoothly to avoid clicks when the volume changes
-                smooth += (tgt - smooth) * 0.002;
-                let v = if primed { feeder.next(&mut cons) } else { None };
-                let s = match v {
-                    Some(v) => v * smooth,
-                    None => {
-                        if primed {
-                            meter.dry();
-                        }
-                        primed = false;
-                        0.0
+        for frame in data.chunks_mut(channels) {
+            // Ramp the gain smoothly to avoid clicks when the volume changes
+            smooth += (tgt - smooth) * 0.002;
+            let v = if primed { feeder.next(&mut cons) } else { None };
+            let s = match v {
+                Some(v) => v * smooth,
+                None => {
+                    if primed {
+                        meter.dry();
                     }
-                };
-                // Single-driver speaker: write the same channel to every output channel
-                frame.fill(s);
-            }
-        },
-        errors,
-        None,
-    )?;
-    stream.play()?;
-    Ok(stream)
+                    primed = false;
+                    0.0
+                }
+            };
+            // Single-driver speaker: write the same channel to every output channel
+            frame.fill(s);
+        }
+    };
+    output.start(Box::new(data), Box::new(errors))?;
+    Ok(output)
 }
 
 /// Play a short beep on the named playback device, in the background. It mixes with
@@ -596,8 +614,6 @@ impl Engine {
         let host = cpal::default_host();
 
         let (in_dev, in_cfg, mode) = find_source(&host, &cfg.source)?;
-        let left_dev = find_output(&host, &cfg.left)?;
-        let right_dev = find_output(&host, &cfg.right)?;
         let sample_rate = in_cfg.sample_rate;
         let in_ch = in_cfg.channels as usize;
 
@@ -652,7 +668,7 @@ impl Engine {
         )?;
 
         let left = build_output(
-            &left_dev,
+            &cfg.left,
             sample_rate,
             lc,
             shared.clone(),
@@ -661,7 +677,7 @@ impl Engine {
             on_error.clone(),
         )?;
         let right = build_output(
-            &right_dev,
+            &cfg.right,
             sample_rate,
             rc,
             shared.clone(),
@@ -676,8 +692,8 @@ impl Engine {
         info!(
             mode,
             input = %device_name(&in_dev).unwrap_or_default(),
-            left = %device_name(&left_dev).unwrap_or_default(),
-            right = %device_name(&right_dev).unwrap_or_default(),
+            left = left.format().name,
+            right = right.format().name,
             sample_rate,
             "engine started"
         );
@@ -691,7 +707,8 @@ impl Engine {
             }
         };
         Ok(Engine {
-            streams: vec![input, left, right],
+            input: Some(input),
+            outputs: vec![left, right],
             _reporter: Reporter::start(meters.into(), on_window),
         })
     }

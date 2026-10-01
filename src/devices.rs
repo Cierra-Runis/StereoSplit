@@ -62,7 +62,7 @@ unsafe fn take_string(p: PWSTR) -> Option<String> {
     s
 }
 
-unsafe fn friendly_name(dev: &IMMDevice) -> Option<String> {
+pub unsafe fn friendly_name(dev: &IMMDevice) -> Option<String> {
     let store = dev.OpenPropertyStore(STGM_READ).ok()?;
     let pv = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
     take_string(PropVariantToStringAlloc(&pv).ok()?)

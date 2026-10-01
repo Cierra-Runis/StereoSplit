@@ -72,7 +72,8 @@ pub struct Meter {
     gap_max_us: AtomicU32,
     /// Most audio passed in one callback, in µs
     block_max_us: AtomicU32,
-    /// Discontinuities the device reported (cpal's `ErrorKind::Xrun`, only reported for input)
+    /// Gaps on the device side: for input, discontinuities Windows reported (cpal's
+    /// `ErrorKind::Xrun`); for output, times the speaker had played everything it was given
     xruns: AtomicU32,
     /// Input only: time from the capture of one packet to the next, in µs: tells whether a
     /// packet that arrived late was also captured late, or only handed over late
