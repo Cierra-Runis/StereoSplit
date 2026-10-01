@@ -6,18 +6,17 @@ description = "Send the left and right channels of system audio to two separate 
 
 [dependencies]
 cpal = "0.18"
-ringbuf = "0.4"
+ringbuf = "0.5"
 rubato = "5"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 anyhow = "1"
-tray-icon = "0.19"
-winreg = "0.52"
-windows-core = "0.58"
-windows = { version = "0.58", features = [
+tray-icon = "0.26"
+winreg = "0.56"
+windows-core = "0.62"
+windows = { version = "0.62", features = [
     "Data_Xml_Dom",
     "UI_Notifications",
-    "implement",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",

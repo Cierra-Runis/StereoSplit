@@ -7,9 +7,9 @@ use crate::default_device;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use tracing::{error, info};
-use windows::core::{w, PCWSTR};
+use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+    GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
@@ -59,7 +59,7 @@ unsafe extern "system" fn on_console(ctrl: u32) -> BOOL {
     if window.is_null() || ![CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT].contains(&ctrl) {
         return false.into();
     }
-    let _ = PostMessageW(HWND(window), WM_CLOSE, WPARAM(0), LPARAM(0));
+    let _ = PostMessageW(Some(HWND(window)), WM_CLOSE, WPARAM(0), LPARAM(0));
     // Returning from a close event ends the process, so wait here instead; the process
     // exits once main has cleaned up
     std::thread::park();
@@ -92,7 +92,7 @@ pub fn create_window() {
             0,
             None,
             None,
-            module,
+            Some(module.into()),
             None,
         );
         match created {

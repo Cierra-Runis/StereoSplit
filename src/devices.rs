@@ -5,6 +5,7 @@
 use tracing::debug;
 use windows::core::{implement, Result, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
     eRender, EDataFlow, ERole, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
     IMMNotificationClient_Impl, MMDeviceEnumerator, DEVICE_STATE, DEVICE_STATE_ACTIVE,
@@ -14,7 +15,6 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
     STGM_READ,
 };
-use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 
 /// Index of the name matching `pat`: an exact (case-insensitive) name match wins,
 /// otherwise the first name containing it. An empty pattern matches nothing.
