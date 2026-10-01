@@ -43,8 +43,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Both defined in build.rs, which also writes them into the exe's resources
 const APP_NAME: &str = env!("APP_NAME");
 const ICON_RESOURCE: &str = env!("ICON_RESOURCE");
-/// Latency menu, in ms; 0 is automatic
-const LATENCIES: [u32; 5] = [0, 15, 20, 30, 50];
 
 /// Tray icon (left half blue, right half orange, for the left and right channels), embedded
 /// by build.rs from assets/icon/icon.ico at the size the tray uses on this screen
@@ -119,7 +117,6 @@ enum Action {
     /// Play the test tone on a side
     Test(usize),
     Swap,
-    Latency(u32),
     Autostart,
     OpenConfig,
     OpenLog,
@@ -201,17 +198,6 @@ impl Tray {
             }
             menu
         });
-        let latency = Submenu::new("Latency", true);
-        for ms in LATENCIES {
-            let checked = ms == cfg.latency_ms;
-            let text = match ms {
-                0 => "Auto".to_string(),
-                ms => format!("{ms} ms"),
-            };
-            let item = a.check(&text, checked, Action::Latency(ms));
-            let _ = latency.append(&item);
-        }
-
         let separator = PredefinedMenuItem::separator;
         while self.menu.remove_at(0).is_some() {}
         let _ = self.menu.append_items(&[
@@ -223,7 +209,6 @@ impl Tray {
             &a.item("Test left", chosen[0].is_some(), Action::Test(0)),
             &a.item("Test right", chosen[1].is_some(), Action::Test(1)),
             &separator(),
-            &latency,
             &a.check(
                 "Start with Windows",
                 autostart::enabled(),
@@ -253,7 +238,6 @@ impl Tray {
         match action {
             Action::Speaker(side, i) => edit_config(|c| choose(c, side, &devices[i], devices)),
             Action::Swap => edit_config(|c| std::mem::swap(&mut c.left, &mut c.right)),
-            Action::Latency(ms) => edit_config(|c| c.latency_ms = ms),
             Action::Test(side) => test_tone(devices, side),
             Action::Autostart => toggle_autostart(),
             Action::OpenConfig => open(&config::config_path()),

@@ -4,10 +4,13 @@
 //! Each speaker gets a ring buffer holding the source's samples, and a resampler that
 //! converts them to the speaker's own sample rate, so the devices don't have to match.
 //!
-//! Each USB speaker also runs on its own clock, so the two slowly drift apart over time.
-//! The fill level of each ring buffer is held near a target by nudging that speaker's
-//! resampling ratio up or down by a tiny amount, so left and right stay aligned instead of
-//! drifting further and further apart.
+//! Each USB speaker also runs on its own clock, so the two slowly drift apart over time, and
+//! each has its own output buffering. So every speaker measures how long the sound actually
+//! takes from capture until it plays it (from the time stamps Windows gives each packet), and
+//! holds that delay at the same value as the other by nudging its resampling ratio up or down
+//! by a tiny amount. Ears notice a difference of a few tens of µs between left and right as
+//! the sound moving to one side, so the delay itself is held, not a buffer level that only
+//! stands for it.
 
 use crate::config::Config;
 use crate::devices;
@@ -16,14 +19,14 @@ use crate::meter::{Meter, Reporter, Stats};
 use crate::volume::Gain;
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{ErrorKind, SampleFormat, Stream, StreamConfig};
+use cpal::{ErrorKind, SampleFormat, Stream, StreamConfig, StreamInstant};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
     Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -177,49 +180,84 @@ fn find_output(host: &cpal::Host, pat: &str) -> Result<cpal::Device> {
     })
 }
 
-/// Holds one speaker's ring buffer level near the target by returning a resampling ratio
-/// slightly above or below 1 (proportional + integral control). The integral term settles
-/// on the speaker's clock offset, so the level ends up right at the target, keeping left
-/// and right aligned.
+/// Holds one speaker's delay (from capture until it plays the sound) at a goal by returning a
+/// resampling ratio slightly above or below 1 (proportional + integral control). The integral
+/// term settles on the speaker's clock offset, so the delay ends up right at the goal.
+///
+/// When the goal changes, the delay held moves to it at a fixed [`DriftControl::RAMP`], so
+/// both speakers, which get the same goal at the same time, move together and stay aligned all
+/// the way. (Each chasing a jump on its own, they took different paths, so the sound swayed to
+/// one side and back whenever Auto changed the latency.)
 struct DriftControl {
-    target: f32,
-    /// Smoothed fill level, to cancel measurement jitter from input chunking
-    avg: f32,
+    /// The delay held now, in s: on its way to the goal
+    target: f64,
+    /// Smoothed difference between the measured delay and `target`, in s
+    err: f64,
     integral: f64,
+    /// How long, in s, the integral is still left alone after starting
+    hold: f64,
 }
 
 impl DriftControl {
-    const KP: f64 = 0.01;
-    const KI: f64 = 0.00002;
+    /// How long after (re)starting the integral is left alone: a speaker that ran dry often
+    /// can't start right at the goal (the sound to skip to it hasn't arrived), and the integral
+    /// took that for a clock offset, built up to -600 ppm and drained it dry again and again,
+    /// holding it ~0.8 ms behind the other (as logged at 30 ms)
+    const HOLD: f64 = 3.0;
+    /// Speed change per second of delay off target (300 ppm per ms)
+    const KP: f64 = 0.33;
+    /// Integral gain per callback, per second of delay off target
+    const KI: f64 = 0.00067;
+    /// Share of each new measurement taken into the smoothed error, against measurement jitter
+    const SMOOTHING: f64 = 0.02;
+    /// How fast the delay held moves to a new goal: 1 ms per second plays 0.1% slower or
+    /// faster, 1.7 cents, which nobody hears
+    const RAMP: f64 = 0.001;
     /// Never change the speed by more than 0.5% (real clock offsets are ~0.01%)
     const LIMIT: f64 = 0.005;
 
-    fn new(target: usize) -> Self {
+    fn new() -> Self {
         DriftControl {
-            target: target as f32,
-            avg: target as f32,
+            target: 0.0,
+            err: 0.0,
             integral: 0.0,
+            hold: 0.0,
         }
     }
 
-    /// Restart smoothing from `fill`. The integral is kept: the clock offset hasn't changed.
-    fn reset(&mut self, fill: f32) {
-        self.avg = fill;
+    /// Start (or start over, after running dry) right at `goal`. The integral is kept: the
+    /// clock offset hasn't changed.
+    fn start(&mut self, goal: f64) {
+        self.target = goal;
+        self.err = 0.0;
+        self.hold = Self::HOLD;
     }
 
-    /// Hold the level near `target` from now on. The speed stays within its limit, so the level
-    /// gets there gradually (at 0.5%, 10 ms takes 2 s).
-    fn set_target(&mut self, target: usize) {
-        self.target = target as f32;
-    }
-
-    /// Feed the current fill level (in source frames), get the relative ratio to use
-    fn update(&mut self, fill: f32) -> f64 {
-        self.avg += (fill - self.avg) * 0.02;
-        let err = ((self.avg - self.target) / self.target) as f64;
-        self.integral = (self.integral + Self::KI * err).clamp(-Self::LIMIT, Self::LIMIT);
-        // Too full -> consume faster -> fewer output frames per input frame -> ratio below 1
-        (1.0 - Self::KP * err - self.integral).clamp(1.0 - Self::LIMIT, 1.0 + Self::LIMIT)
+    /// Feed the delay measured now and the goal (in s) and how long the block about to be
+    /// played lasts, get the relative ratio to use
+    fn update(&mut self, delay: f64, goal: f64, block: f64) -> f64 {
+        let step = Self::RAMP * block;
+        let moved = (goal - self.target).clamp(-step, step);
+        self.target += moved;
+        self.err += (delay - self.target - self.err) * Self::SMOOTHING;
+        // While the target moves, the error comes from it moving, not from the clock; right
+        // after starting, from where it started
+        self.hold = (self.hold - block).max(0.0);
+        if self.target == goal && self.hold == 0.0 {
+            self.integral = (self.integral + Self::KI * self.err).clamp(-Self::LIMIT, Self::LIMIT);
+        }
+        // Moving the target: play slower (ratio above 1) to build up delay as fast as it moves.
+        // Only while it ramps: the goal also wobbles by a µs or so as the output latency is
+        // averaged, and following that at once swung the speed by ±100 ppm every block (as
+        // logged). Such small steps are left to the error terms.
+        let ramp = if moved.abs() >= step && block > 0.0 {
+            moved / block
+        } else {
+            0.0
+        };
+        // Too much delay -> consume faster -> fewer output frames per input frame -> below 1
+        (1.0 + ramp - Self::KP * self.err - self.integral)
+            .clamp(1.0 - Self::LIMIT, 1.0 + Self::LIMIT)
     }
 }
 
@@ -233,6 +271,8 @@ struct Feeder {
     output: Vec<f32>,
     pos: usize,
     len: usize,
+    /// Source frames taken out of the ring buffer so far
+    popped: u64,
 }
 
 impl Feeder {
@@ -256,12 +296,23 @@ impl Feeder {
             ratio,
             pos: 0,
             len: 0,
+            popped: 0,
         })
     }
 
-    /// Output frames still waiting to be played, in source frames
-    fn buffered(&self) -> f32 {
-        ((self.len - self.pos) as f64 / self.ratio) as f32
+    /// The source frame (counting from the first one ever pushed, with fractions) the next
+    /// output sample stands for: the frames popped, less the output still waiting to be played
+    /// and the resampler's own delay, in source frames
+    fn next_frame(&self) -> f64 {
+        let waiting = self.len - self.pos + self.rs.output_delay();
+        self.popped as f64 - waiting as f64 / self.ratio
+    }
+
+    /// Throw away up to `frames` source frames; returns how many were
+    fn skip(&mut self, cons: &mut HeapCons<f32>, frames: usize) -> usize {
+        let skipped = cons.skip(frames);
+        self.popped += skipped as u64;
+        skipped
     }
 
     fn reset(&mut self) {
@@ -282,6 +333,7 @@ impl Feeder {
                 return None;
             }
             cons.pop_slice(&mut self.input[..need]);
+            self.popped += need as u64;
             let input = InterleavedSlice::new(&self.input[..need], 1, need).ok()?;
             let frames = self.output.len();
             let mut output = InterleavedSlice::new_mut(&mut self.output[..], 1, frames).ok()?;
@@ -298,88 +350,178 @@ impl Feeder {
     }
 }
 
-/// The latency both speakers keep, as source frames buffered. Shared, so left and right stay
-/// aligned when it changes.
-type Target = Arc<AtomicUsize>;
-
-/// Most time since the last input packet that [`input_level`] counts, in case input stops
-const INPUT_WAIT_MAX: Duration = Duration::from_millis(40);
-
-/// The buffer level to steer by, in source frames: what is buffered (`occupied` in the ring,
-/// `buffered` in the resampler), plus the input captured since the last packet arrived, which
-/// comes with the next one. That is how long the sound takes to get through, whenever a
-/// speaker looks.
-///
-/// Input arrives in packets (10 ms for loopback capture), so the plain level jumps by a packet
-/// each time one arrives, and by two when two come at once. Steering by the plain level, the
-/// drift control chased those jumps (wobbling the speed by ±1000 ppm every second when packets
-/// came in pairs), and a speaker looking just before the packets arrive kept a different delay
-/// from one looking just after, pulling left and right apart by several ms.
-fn input_level(occupied: usize, buffered: f32, since_input: Duration, in_rate: u32) -> f32 {
-    occupied as f32 + buffered + since_input.min(INPUT_WAIT_MAX).as_secs_f32() * in_rate as f32
+/// `t` in the 100 ns ticks Windows time stamps audio with
+fn ticks(t: StreamInstant) -> u64 {
+    (t.as_nanos() / 100) as u64
 }
 
-/// Output stream for the speaker of `meter`'s side, playing input from the stream `input`
-/// meters
-#[allow(clippy::too_many_arguments)]
+/// `t` in seconds (since boot)
+fn secs(t: StreamInstant) -> f64 {
+    t.as_nanos() as f64 * 1e-9
+}
+
+/// When each source frame was captured: the input publishes one frame (counting from the first
+/// one it pushed) and when it was captured, from which the time of every other frame follows
+/// at the sample rate. Both are packed into one atomic, so a speaker never reads one packet's
+/// frame with another's time: the frame's lowest [`CaptureClock::FRAME_BITS`] bits and the
+/// time's lowest 40 bits (in 100 ns ticks). Everything it is used for lies within a second of
+/// the published frame, so the bits cut off (349 s of frames at 48 kHz, 30 h of time) never
+/// matter.
+struct CaptureClock(AtomicU64);
+
+impl CaptureClock {
+    const FRAME_BITS: u32 = 24;
+    const FRAME_MASK: u64 = (1 << Self::FRAME_BITS) - 1;
+    const TIME_BITS: u32 = 64 - Self::FRAME_BITS;
+    /// Before the first packet
+    const UNSET: u64 = u64::MAX;
+
+    fn new() -> Self {
+        CaptureClock(AtomicU64::new(Self::UNSET))
+    }
+
+    /// Source frame `frame` was captured at `at` (in 100 ns ticks)
+    fn publish(&self, frame: u64, at: u64) {
+        let packed = (at << Self::FRAME_BITS) | (frame & Self::FRAME_MASK);
+        self.0.store(packed, Ordering::Relaxed);
+    }
+
+    /// How long after source frame `frame` was captured `at` comes (in s, from 100 ns ticks);
+    /// None before the first packet
+    fn delay(&self, frame: f64, at: u64, rate: u32) -> Option<f64> {
+        let packed = self.0.load(Ordering::Relaxed);
+        if packed == Self::UNSET {
+            return None;
+        }
+        // The difference of two values of which only the lowest `bits` bits are known, if it
+        // is small
+        let wrapped = |diff: u64, bits: u32| ((diff << (64 - bits)) as i64 >> (64 - bits)) as f64;
+        let whole = frame.floor();
+        let frames = wrapped(
+            (whole as i64 as u64).wrapping_sub(packed & Self::FRAME_MASK),
+            Self::FRAME_BITS,
+        );
+        let time = wrapped(at.wrapping_sub(packed >> Self::FRAME_BITS), Self::TIME_BITS);
+        Some(time * 1e-7 - (frames + frame - whole) / rate as f64)
+    }
+}
+
+/// What the input and both speakers share
+struct Shared {
+    /// How much sound to keep buffered (in source frames), on top of the slower output's own
+    /// latency; set by Auto
+    target: AtomicUsize,
+    /// Each speaker's own output latency (left, right), smoothed, in µs; 0 until it has played
+    out_lat_us: [AtomicU32; 2],
+    clock: CaptureClock,
+}
+
+impl Shared {
+    /// The delay both speakers keep, from capture until they play the sound, in s: the target
+    /// on top of the slower output, so that one keeps the target buffered and the other keeps
+    /// more, to play the sound at the same time. None until both speakers have played.
+    fn goal(&self, in_rate: u32) -> Option<f64> {
+        let [l, r] = self
+            .out_lat_us
+            .each_ref()
+            .map(|a| a.load(Ordering::Relaxed));
+        if l == 0 || r == 0 {
+            return None;
+        }
+        let target = self.target.load(Ordering::Relaxed) as f64 / in_rate as f64;
+        Some(target + l.max(r) as f64 * 1e-6)
+    }
+}
+
+/// How much of each callback's output latency goes into the smoothed one (about 2 s)
+const OUT_LAT_SMOOTHING: f64 = 0.005;
+/// Callbacks whose output latency is left out at the start: the first ones find the output's
+/// buffer still empty and report too little (13 ms instead of 33, going by the log), which held
+/// the speakers 20 ms short at first, so they ran dry over and over and took 20 s to get there
+const OUT_LAT_SETTLE: u32 = 10;
+
+/// Output stream for the speaker of `meter`'s side
 fn build_output(
     dev: &cpal::Device,
     in_rate: u32,
     mut cons: HeapCons<f32>,
-    shared_target: Target,
+    shared: Arc<Shared>,
     gain: Gain,
     meter: Arc<Meter>,
-    input: Arc<Meter>,
     on_error: OnError,
 ) -> Result<Stream> {
     let config = f32_config(dev, true)?;
     let out_rate = config.sample_rate;
     let channels = config.channels as usize;
     let mut feeder = Feeder::new(in_rate, out_rate)?;
-    let mut target = shared_target.load(Ordering::Relaxed);
-    let mut drift = DriftControl::new(target);
+    let mut drift = DriftControl::new();
     let mut primed = false;
     let mut smooth = gain.get();
+    let mut out_lat_avg: Option<f64> = None;
+    let mut callbacks = 0u32;
     let side = meter.kind();
+    let slot = (side == StreamKind::Right) as usize;
     let device = device_name(dev).unwrap_or_default();
     info!(%side, device, in_rate, out_rate, "output resampling");
 
     let errors = on_stream_error(meter.clone(), on_error);
     let stream = dev.build_output_stream(
         config,
-        move |data: &mut [f32], _| {
-            meter.callback(data.len() / channels, out_rate);
+        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+            let frames = data.len() / channels;
+            meter.callback(frames, out_rate);
             let tgt = gain.get();
-            let now = shared_target.load(Ordering::Relaxed);
-            if now != target {
-                target = now;
-                drift.set_target(target);
-            }
-            let avail = cons.occupied_len();
 
-            // Severe backlog (e.g. after a system stall) -> drop straight down to the target
-            if avail > target * 3 {
-                cons.skip(avail - target);
-                drift.reset(target as f32);
+            // When the first frame written now will be heard, and how long that is from now
+            let ts = info.timestamp();
+            let playback = ticks(ts.playback);
+            let out_lat = ts.playback.duration_since(ts.callback).as_secs_f64();
+            if callbacks < OUT_LAT_SETTLE {
+                callbacks += 1;
+            } else {
+                let avg = out_lat_avg.map_or(out_lat, |a| a + (out_lat - a) * OUT_LAT_SMOOTHING);
+                out_lat_avg = Some(avg);
+                shared.out_lat_us[slot].store(((avg * 1e6) as u32).max(1), Ordering::Relaxed);
+            }
+            let Some(goal) = shared.goal(in_rate) else {
+                data.fill(0.0);
+                return;
+            };
+
+            // Severe backlog (e.g. after a system stall) -> start over at the goal
+            if primed && cons.occupied_len() as f64 > goal * in_rate as f64 * 3.0 {
+                primed = false;
                 meter.skip();
             }
-            // On startup or after running dry, fill up to the target before playing,
-            // so left and right start from the same point
-            let since_input = input.since_last();
+            // On startup or after running dry, wait until the oldest sound buffered is as old
+            // as the goal, and skip what is older, so both speakers start out together. The
+            // block also needs to be buffered (if input stopped, the sound is old but not there).
             if !primed {
-                if cons.occupied_len() >= target {
-                    primed = true;
-                    feeder.reset();
-                    drift.reset(input_level(cons.occupied_len(), 0.0, since_input, in_rate));
-                } else {
-                    data.fill(0.0);
-                    return;
+                feeder.reset();
+                let delay = shared.clock.delay(feeder.next_frame(), playback, in_rate);
+                let block = frames * in_rate as usize / out_rate as usize + CHUNK_IN;
+                match delay {
+                    Some(delay) if delay >= goal && cons.occupied_len() >= block => {
+                        let excess = ((delay - goal) * in_rate as f64) as usize;
+                        let spare = cons.occupied_len() - block;
+                        let skipped = feeder.skip(&mut cons, excess.min(spare));
+                        meter.started(delay - goal - skipped as f64 / in_rate as f64);
+                        drift.start(goal);
+                        primed = true;
+                    }
+                    _ => {
+                        data.fill(0.0);
+                        return;
+                    }
                 }
             }
 
-            let fill = input_level(cons.occupied_len(), feeder.buffered(), since_input, in_rate);
-            let rel = drift.update(fill);
-            meter.drift(fill, in_rate, rel);
+            let Some(delay) = shared.clock.delay(feeder.next_frame(), playback, in_rate) else {
+                data.fill(0.0);
+                return;
+            };
+            let rel = drift.update(delay, goal, frames as f64 / out_rate as f64);
+            meter.output(delay, out_lat, rel);
             feeder.set_relative_ratio(rel);
 
             for frame in data.chunks_mut(channels) {
@@ -462,13 +604,11 @@ impl Engine {
         // At least two resampler steps must fit in the buffer, or it would never start playing
         let to_frames =
             move |us: u32| (sample_rate as usize * us as usize / 1_000_000).max(CHUNK_IN * 2);
-        let auto = cfg.latency_ms == 0;
-        let start_us = if auto {
-            latency::START_US
-        } else {
-            cfg.latency_ms.max(5) * 1000
-        };
-        let target: Target = Arc::new(AtomicUsize::new(to_frames(start_us)));
+        let shared = Arc::new(Shared {
+            target: AtomicUsize::new(to_frames(latency::START_US)),
+            out_lat_us: [AtomicU32::new(0), AtomicU32::new(0)],
+            clock: CaptureClock::new(),
+        });
         let cap = sample_rate as usize; // 1 second of capacity, enough to absorb any jitter
 
         let (mut lp, lc): (HeapProd<f32>, HeapCons<f32>) = HeapRb::<f32>::new(cap).split();
@@ -479,18 +619,33 @@ impl Engine {
         let [in_meter, left_meter, right_meter] = meters.clone();
 
         let errors = on_stream_error(in_meter.clone(), on_error.clone());
+        let input_shared = shared.clone();
+        // Frames pushed so far, and when the first and the last frame of the previous packet
+        // were captured
+        let mut pushed = 0u64;
+        let mut prev: Option<(f64, f64)> = None;
         let input = in_dev.build_input_stream(
             in_cfg,
-            move |data: &[f32], _| {
+            move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                let frames = data.len() / in_ch;
+                in_meter.callback(frames, sample_rate);
                 for frame in data.chunks(in_ch) {
                     let l = frame[0];
                     let r = if in_ch > 1 { frame[1] } else { l };
-                    // Drop samples when the buffer is full (the output side catches up on its own)
+                    // Drop samples when the buffer is full (the output side catches up on its
+                    // own). The speakers' frame counts are then off from `pushed`, but a full
+                    // second of backlog means a speaker has stopped anyway.
                     let _ = lp.try_push(l);
                     let _ = rp.try_push(r);
                 }
-                // Only now, as the speakers take this as the time the input arrived
-                in_meter.callback(data.len() / in_ch, sample_rate);
+                let ts = info.timestamp();
+                input_shared.clock.publish(pushed, ticks(ts.capture));
+                pushed += frames as u64;
+                let start = secs(ts.capture);
+                let end = start + frames as f64 / sample_rate as f64;
+                let now = secs(ts.callback);
+                in_meter.packet(prev.map(|(s, _)| start - s), prev.map(|(_, e)| now - e));
+                prev = Some((start, end));
             },
             errors,
             None,
@@ -500,49 +655,38 @@ impl Engine {
             &left_dev,
             sample_rate,
             lc,
-            target.clone(),
+            shared.clone(),
             gain.clone(),
             left_meter,
-            meters[0].clone(),
             on_error.clone(),
         )?;
         let right = build_output(
             &right_dev,
             sample_rate,
             rc,
-            target.clone(),
+            shared.clone(),
             gain,
             right_meter,
-            meters[0].clone(),
             on_error,
         )?;
         input
             .play()
             .map_err(|e| anyhow!("Failed to start capturing sound: {e}"))?;
 
-        let latency_text = if auto {
-            "auto".to_string()
-        } else {
-            format!("{} ms", cfg.latency_ms)
-        };
         info!(
             mode,
             input = %device_name(&in_dev).unwrap_or_default(),
             left = %device_name(&left_dev).unwrap_or_default(),
             right = %device_name(&right_dev).unwrap_or_default(),
             sample_rate,
-            latency = %latency_text,
             "engine started"
         );
 
         let chunk_us = (CHUNK_IN * 1_000_000 / sample_rate as usize) as u32;
-        let mut control = auto.then(|| AutoLatency::new(Instant::now(), chunk_us));
+        let mut control = AutoLatency::new(Instant::now(), chunk_us);
         let on_window = move |stats: &[Stats]| {
-            let Some(control) = &mut control else {
-                return;
-            };
             if let Some(us) = control.update(Instant::now(), stats) {
-                target.store(to_frames(us), Ordering::Relaxed);
+                shared.target.store(to_frames(us), Ordering::Relaxed);
                 info!(latency_ms = us as f32 / 1000.0, "latency set");
             }
         };
@@ -577,22 +721,62 @@ mod tests {
         );
     }
 
-    /// With the speaker clock 200 ppm off, the buffer level still settles at the target
+    /// With the speaker clock 200 ppm off, the delay still settles at the goal
     #[test]
     fn drift_control_settles_on_target() {
-        let target = 960.0f64;
-        let per_callback = 480.0f64;
-        let clock_offset = 1.0002;
-        let mut ctl = DriftControl::new(target as usize);
-        let mut fill = target;
+        let (goal, block, clock_offset) = (0.030, 0.010, 1.0002);
+        let mut ctl = DriftControl::new();
+        ctl.start(goal);
+        let mut delay = goal;
         for _ in 0..20_000 {
-            let rel = ctl.update(fill as f32);
-            fill += per_callback * clock_offset - per_callback / rel;
+            let rel = ctl.update(delay, goal, block);
+            delay += block * clock_offset - block / rel;
         }
-        assert!((fill - target).abs() < 2.0, "fill settled at {fill}");
+        assert!((delay - goal).abs() < 20e-6, "delay settled at {delay}");
+    }
+
+    /// The goal wobbling by a µs from one block to the next (the output latency is stored in
+    /// whole µs) barely moves the speed
+    #[test]
+    fn goal_wobble_keeps_the_speed_steady() {
+        let (goal, block) = (0.063, 0.010);
+        let mut ctl = DriftControl::new();
+        ctl.start(goal);
+        let mut delay = goal;
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for i in 0..2_000 {
+            let wobble = if i % 2 == 0 { 1e-6 } else { 0.0 };
+            let rel = ctl.update(delay, goal + wobble, block);
+            delay += block - block / rel;
+            (lo, hi) = (lo.min(rel), hi.max(rel));
+        }
+        let ppm = (hi - lo) * 1e6;
+        assert!(ppm < 5.0, "speed swung by {ppm} ppm");
+    }
+
+    /// Frame counts and times are worked out right across the points where the bits kept of
+    /// them start over
+    #[test]
+    fn capture_clock_counts_across_wraparound() {
+        let clock = CaptureClock::new();
+        assert_eq!(clock.delay(0.0, 0, 48_000), None);
+        // A frame captured 5 ms before the time bits start over, 10 frames before the frame
+        // bits do (as if after days of running)
+        let frame = (7 << 24) + (1 << 24) - 10;
+        let at = (3 << 40) + (1 << 40) - 50_000;
+        clock.publish(frame, at);
+        // Half a frame past 10 ms of frames later, played 30 ms after the published one was
+        // captured
+        let delay = clock.delay((frame + 480) as f64 + 0.5, at + 300_000, 48_000);
+        let expected = 0.030 - 480.5 / 48_000.0;
+        assert!((delay.unwrap() - expected).abs() < 1e-9, "{delay:?}");
+        // And a frame from before the published one
+        let delay = clock.delay(frame as f64 - 48.0, at + 100_000, 48_000);
+        assert!((delay.unwrap() - 0.011).abs() < 1e-9, "{delay:?}");
     }
 
     /// How the input arrives and a speaker takes it, for [`simulate`]
+    #[derive(Debug, Clone, Copy)]
     struct Timing {
         /// Every how many packets one comes a whole packet late, with the next; 0 for never
         pairs_every: u64,
@@ -600,6 +784,8 @@ mod tests {
         /// against the input in 100 s, 0 keeps it at `phase_ms` after each packet
         clock_offset: f64,
         phase_ms: f64,
+        /// How long after a block is handed over the speaker plays it
+        out_lat_ms: f64,
     }
 
     /// What [`simulate`] saw
@@ -609,87 +795,116 @@ mod tests {
         dry: u32,
         /// How much the speed varied in the second half (standard deviation), in ppm
         wobble_ppm: f64,
-        /// How long after it was captured the sound was played in the second half, on
-        /// average, in ms
-        delay_ms: f64,
+        /// How long after it was captured the sound was played, on average over each second,
+        /// in ms
+        delay_ms: Vec<f64>,
     }
 
-    /// 200 s of one shared-mode speaker at `target_ms`: 10 ms input packets arriving up to
-    /// 3 ms late (as in the logs), and 10 ms blocks
-    fn simulate(target_ms: f64, timing: Timing) -> Run {
-        let mut seed = 1u64;
-        let mut random = move || {
+    /// A random number generator in [0, 1)
+    fn random(mut seed: u64) -> impl FnMut() -> f64 {
+        move || {
             seed = seed
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
             (seed >> 11) as f64 / (1u64 << 53) as f64
-        };
-        let target = (target_ms * 48.0) as usize;
-        let mut ctl = DriftControl::new(target);
-        let mut level = target as f64;
-        let (mut block, mut dry) = (0u64, 0);
-        // Packet p (from 1) holds the frames captured until 10p ms, frame i at i / 48 ms. It
-        // arrives up to 3 ms after that, or, if it is one to come late, together with the next.
+        }
+    }
+
+    /// 200 s of one shared-mode speaker keeping `ring_ms(t)` buffered on top of the slower
+    /// output (`max_out_lat_ms`): 10 ms input packets arriving up to 3 ms late (as in the
+    /// logs, the same packets for every speaker), 10 ms blocks, and playback times that Windows
+    /// reports up to 0.3 ms off
+    fn simulate(ring_ms: impl Fn(f64) -> f64, max_out_lat_ms: f64, timing: Timing) -> Run {
+        let mut input_random = random(1);
+        let mut noise = random(2 + (timing.phase_ms * 1000.0) as u64);
+        let clock = CaptureClock::new();
+        let mut ctl = DriftControl::new();
+        let (mut primed, mut dry) = (false, 0);
+        // Source frames taken out (frame i is captured at i / 48 ms), and arrived
+        let (mut consumed, mut arrived) = (0.0f64, 0.0f64);
+        // Packet p (from 1) holds the frames captured from 10(p - 1) until 10p ms. It arrives
+        // up to 3 ms after that, or, if it is one to come late, together with the next.
         let (mut packet, mut count) = (1u64, 1u64);
-        let mut next_packet = 10.0 + random() * 3.0;
-        let (mut next_block, mut arrived) = (timing.phase_ms, 0.0f64);
-        let (mut n, mut sum, mut sum2, mut delay) = (0.0, 0.0, 0.0, 0.0);
-        // The buffer starts out holding frames captured before 0
-        let mut played = -(target as f64);
+        let mut next_packet = 10.0 + input_random() * 3.0;
+        let (mut block, mut next_block) = (0u64, timing.phase_ms);
+        let mut windows = vec![(0.0, 0.0); 200];
+        let (mut n, mut sum, mut sum2) = (0.0, 0.0, 0.0);
         while next_block < 200_000.0 {
             if next_packet <= next_block {
-                level += 480.0 * count as f64;
-                arrived = next_packet;
+                for p in packet..packet + count {
+                    clock.publish(480 * (p - 1), (p - 1) * 100_000);
+                }
                 packet += count;
+                arrived = 480.0 * (packet - 1) as f64;
                 let pair = timing.pairs_every > 0 && packet % timing.pairs_every == 0;
                 count = if pair { 2 } else { 1 };
                 let newest = packet + count - 1;
-                next_packet = (newest as f64 * 10.0 + random() * 3.0).max(next_packet);
-            } else {
-                let since = Duration::from_secs_f64((next_block - arrived) / 1000.0);
-                let fill = input_level(level as usize, 0.0, since, 48_000);
-                let ratio = ctl.update(fill);
-                // A block needs its 480 frames plus a resampler step on hand
-                if next_block > 10_000.0 && level < (480 + CHUNK_IN) as f64 {
-                    dry += 1;
-                }
-                if next_block > 100_000.0 {
-                    n += 1.0;
-                    sum += ratio;
-                    sum2 += ratio * ratio;
-                    delay += next_block - played / 48.0;
-                }
-                level = (level - 480.0 / ratio).max(0.0);
-                played += 480.0 / ratio;
-                block += 1;
-                next_block = timing.phase_ms + block as f64 * 10.0 / (1.0 + timing.clock_offset);
+                next_packet = (newest as f64 * 10.0 + input_random() * 3.0).max(next_packet);
+                continue;
             }
+            let t = next_block;
+            let playback = t + timing.out_lat_ms;
+            let reported = ((playback + (noise() - 0.5) * 0.6) * 10_000.0) as u64;
+            let goal = (ring_ms(t) + max_out_lat_ms) / 1000.0;
+            // A block needs its 480 frames plus a resampler step on hand
+            let needed = (480 + CHUNK_IN) as f64;
+            if !primed {
+                if let Some(delay) = clock.delay(consumed, reported, 48_000) {
+                    if delay >= goal && arrived - consumed >= needed {
+                        consumed += ((delay - goal) * 48_000.0).min(arrived - consumed - needed);
+                        ctl.start(goal);
+                        primed = true;
+                    }
+                }
+            }
+            if primed {
+                let delay = clock.delay(consumed, reported, 48_000).unwrap();
+                let ratio = ctl.update(delay, goal, 0.010);
+                if arrived - consumed < needed {
+                    if t > 10_000.0 {
+                        dry += 1;
+                    }
+                    primed = false;
+                } else {
+                    let w = &mut windows[(t / 1000.0) as usize];
+                    w.0 += playback - consumed / 48.0;
+                    w.1 += 1.0;
+                    if t > 100_000.0 {
+                        n += 1.0;
+                        sum += ratio;
+                        sum2 += ratio * ratio;
+                    }
+                    consumed += 480.0 / ratio;
+                }
+            }
+            block += 1;
+            next_block = timing.phase_ms + block as f64 * 10.0 / (1.0 + timing.clock_offset);
         }
         Run {
             dry,
             wobble_ppm: (sum2 / n - (sum / n).powi(2)).max(0.0).sqrt() * 1e6,
-            delay_ms: delay / n,
+            delay_ms: windows.iter().map(|(sum, n)| sum / n).collect(),
         }
     }
 
-    /// Packets up to 3 ms late, speakers sweeping through every phase against them
+    /// Packets up to 3 ms late, a speaker sweeping through every phase against them
     const LATE: Timing = Timing {
         pairs_every: 0,
         clock_offset: 1e-4,
         phase_ms: 5.0,
+        out_lat_ms: 20.0,
     };
 
     /// 20 ms ran dry now and then, as in the logs; what Auto picks for such input
     /// (13 + 10.1 + 0.7 + 1 ms) doesn't
     #[test]
     fn auto_latency_holds_where_20_ms_ran_dry() {
-        assert!(simulate(20.0, LATE).dry > 0);
-        assert_eq!(simulate(24.8, LATE).dry, 0);
+        assert!(simulate(|_| 20.0, 20.0, LATE).dry > 0);
+        assert_eq!(simulate(|_| 24.8, 20.0, LATE).dry, 0);
     }
 
     /// Packets coming in pairs every second, as in the later logs, used to wobble the speed by
-    /// ±1000 ppm every second. (What is left comes from the packets' 3 ms jitter here; 150 ppm
-    /// is 0.26 cents.)
+    /// ±1000 ppm every second. Steering by when the sound was captured, they don't show at all.
     #[test]
     fn packets_in_pairs_keep_the_speed_steady() {
         let pairs = Timing {
@@ -697,28 +912,79 @@ mod tests {
             ..LATE
         };
         // Waits of up to 23 ms for input
-        let run = simulate(23.0 + 10.0 + 0.7 + 1.0, pairs);
+        let run = simulate(|_| 23.0 + 10.0 + 0.7 + 1.0, 20.0, pairs);
         assert_eq!(run.dry, 0, "{run:?}");
-        assert!(run.wobble_ppm < 150.0, "{run:?}");
+        assert!(run.wobble_ppm < 30.0, "{run:?}");
     }
 
-    /// With every packet coming in a pair, a speaker taking its blocks just after they arrive
-    /// and one taking them just before get the same delay, so left and right stay together
+    /// The most left and right were apart over any second from 30 s on (by then the drift
+    /// control has learned the clock offsets), in ms. Without the noise in the reported
+    /// playback times it is 0; with it, a few tens of µs.
+    fn skew_ms(left: &Run, right: &Run) -> f64 {
+        let skew = left
+            .delay_ms
+            .iter()
+            .zip(&right.delay_ms)
+            .map(|(l, r)| l - r);
+        skew.skip(30).fold(0.0, |max: f64, s| max.max(s.abs()))
+    }
+
+    /// Speakers with different output latencies and clocks, taking their blocks just after
+    /// the packets arrive and just before, still play the sound at the same time
     #[test]
-    fn left_and_right_keep_the_same_delay() {
-        let at = |phase_ms| Timing {
-            pairs_every: 2,
-            clock_offset: 0.0,
-            phase_ms,
+    fn left_and_right_play_together() {
+        let left = Timing {
+            pairs_every: 97,
+            clock_offset: 1e-4,
+            phase_ms: 0.5,
+            out_lat_ms: 12.0,
         };
-        // Waits of up to 23 ms for input
-        let target = 23.0 + 10.0 + 0.7 + 1.0;
-        let (early, late) = (simulate(target, at(0.5)), simulate(target, at(9.5)));
-        assert_eq!(early.dry + late.dry, 0, "{early:?} {late:?}");
-        assert!(early.wobble_ppm < 150.0 && late.wobble_ppm < 150.0);
-        assert!(
-            (early.delay_ms - late.delay_ms).abs() < 1.0,
-            "{early:?} {late:?}"
-        );
+        let right = Timing {
+            clock_offset: -0.8e-4,
+            phase_ms: 9.5,
+            out_lat_ms: 22.0,
+            ..left
+        };
+        let ring = |_| 23.0 + 10.0 + 0.7 + 1.0;
+        let (l, r) = (simulate(ring, 22.0, left), simulate(ring, 22.0, right));
+        assert_eq!(l.dry + r.dry, 0, "{l:?} {r:?}");
+        let skew = skew_ms(&l, &r);
+        assert!(skew < 0.05, "left and right up to {skew} ms apart");
+    }
+
+    /// When Auto changes the latency, both speakers get there together
+    #[test]
+    fn latency_changes_keep_left_and_right_together() {
+        let left = Timing {
+            clock_offset: 1e-4,
+            phase_ms: 0.5,
+            out_lat_ms: 12.0,
+            ..LATE
+        };
+        let right = Timing {
+            clock_offset: -0.8e-4,
+            phase_ms: 9.5,
+            out_lat_ms: 22.0,
+            ..LATE
+        };
+        let ring = |t| {
+            if (100_000.0..160_000.0).contains(&t) {
+                32.6
+            } else {
+                24.8
+            }
+        };
+        let (l, r) = (simulate(ring, 22.0, left), simulate(ring, 22.0, right));
+        assert_eq!(l.dry + r.dry, 0, "{l:?} {r:?}");
+        let skew = skew_ms(&l, &r);
+        assert!(skew < 0.05, "left and right up to {skew} ms apart");
+        // 7.8 ms at 1 ms/s
+        for (second, ring) in [(99, 24.8), (112, 32.6), (159, 32.6), (172, 24.8)] {
+            let delay = l.delay_ms[second];
+            assert!(
+                (delay - ring - 22.0).abs() < 0.1,
+                "{delay} ms at {second} s, wanted {ring} + 22"
+            );
+        }
     }
 }

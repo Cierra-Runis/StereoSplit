@@ -31,12 +31,6 @@ pub struct Config {
     /// Speaker for the right channel
     pub right: String,
 
-    /// Buffer latency in milliseconds, or 0 for automatic: the lowest that doesn't crackle,
-    /// worked out all the time from how the devices deliver and take the sound. A fixed value
-    /// below that crackles now and then.
-    #[default(0)]
-    pub latency_ms: u32,
-
     /// Where to capture sound from: VB-CABLE's playback side (reads what it is playing directly,
     /// without opening any recording device). A recording device such as "CABLE Output"
     /// also works.
@@ -153,7 +147,7 @@ mod tests {
     fn new_file_has_every_key_commented() {
         let cfg = Config {
             left: "Desk L".into(),
-            latency_ms: 35,
+            right: "Desk R".into(),
             ..Config::default()
         };
         let out = update(&Config::toml_example(), &cfg).unwrap();
@@ -172,15 +166,15 @@ mod tests {
 
     #[test]
     fn update_keeps_user_edits() {
-        let text = "# mine\nlatency_ms = 20 # was crackling at 15\n\n# note\nleft = \"x\"\n";
+        let text = "# mine\nleft = \"x\" # the one by the window\n\n# note\nright = \"y\"\n";
         let cfg = Config {
-            latency_ms: 50,
+            left: "z".into(),
             ..Config::default()
         };
         let out = update(text, &cfg).unwrap();
         assert!(
             out.starts_with(
-                "# mine\nlatency_ms = 50 # was crackling at 15\n\n# note\nleft = \"\"\n"
+                "# mine\nleft = \"z\" # the one by the window\n\n# note\nright = \"\"\n"
             ),
             "{out}"
         );
