@@ -76,8 +76,9 @@ impl State {
         }
     }
 
-    /// Take in how an attempt to start ended: `Running`, `BadConfig`, `NoSpeakers` or
-    /// `Failed`. Returns how long to wait before trying again, or None to wait for a change.
+    /// Take in how an attempt to start ended: `Running`, `BadConfig`, `NoSpeakers`, `Failed`,
+    /// or `Starting` if the engine has to stop first. Returns how long to wait before trying
+    /// again, or None to wait for a change.
     fn attempted(&mut self, new: State) -> Option<Duration> {
         *self = match (&*self, new) {
             // Failing to start the same config again is still reconnecting
@@ -87,7 +88,12 @@ impl State {
             },
             (_, new) => new,
         };
-        matches!(self, State::Reconnecting { .. } | State::Failed(_)).then_some(RETRY_FALLBACK)
+        match self {
+            State::Reconnecting { .. } | State::Failed(_) => Some(RETRY_FALLBACK),
+            // Give the engine stopping now a moment to let go of the speakers
+            State::Starting => Some(CONFIG_QUIET),
+            _ => None,
+        }
     }
 
     /// Take in an event other than `Quit`. Returns how long to let things settle before
@@ -108,8 +114,10 @@ impl State {
                 Some(RECONNECT_DELAY)
             }
             (_, Event::ConfigChanged) => {
-                // The engine stops, and failing to start after this is no longer reconnecting
-                if matches!(self, State::Running { .. } | State::Reconnecting { .. }) {
+                // A running engine plays on until the new config is read, since some changes
+                // apply without a restart; failing to start after this is no longer
+                // reconnecting
+                if matches!(self, State::Reconnecting { .. }) {
                     *self = State::Starting;
                 }
                 Some(CONFIG_QUIET)
@@ -213,7 +221,12 @@ pub fn spawn(
             match ev {
                 Ok(Event::Quit) | Err(RecvTimeoutError::Disconnected) => return,
                 Err(RecvTimeoutError::Timeout) => {
-                    retry_at = state.attempted(audio.start()).map(|d| Instant::now() + d)
+                    let running = match &state {
+                        State::Running { cfg, generation } => Some((cfg, *generation)),
+                        _ => None,
+                    };
+                    let new = audio.start(running);
+                    retry_at = state.attempted(new).map(|d| Instant::now() + d)
                 }
                 Ok(ev) => {
                     if matches!(ev, Event::ConfigChanged | Event::DevicesChanged) {
@@ -251,11 +264,27 @@ struct Audio {
 impl Audio {
     /// Load the config and start the engine with it, making the source the default playback
     /// device only while the engine runs. Returns the state that ends in.
-    fn start(&mut self) -> State {
+    ///
+    /// If an engine is `running` (with its config and generation), only changes it can take
+    /// while playing are applied to it; any other change returns `Starting`, to stop it first.
+    fn start(&mut self, running: Option<(&Config, u64)>) -> State {
         let cfg = match config::load() {
             Ok(c) => c,
             Err(e) => return State::BadConfig(format!("{e:#}")),
         };
+        if let (Some((old, generation)), Some(engine)) = (running, &self.engine) {
+            let live = Config {
+                right_delay_us: old.right_delay_us,
+                ..cfg.clone()
+            };
+            if live != *old {
+                return State::Starting;
+            }
+            if cfg.right_delay_us != old.right_delay_us {
+                engine.set_right_delay(cfg.right_delay_us);
+            }
+            return State::Running { cfg, generation };
+        }
         if cfg.left.is_empty() || cfg.right.is_empty() {
             self.release(&cfg);
             return State::NoSpeakers;
@@ -408,9 +437,11 @@ mod tests {
     }
 
     #[test]
-    fn a_config_change_stops_the_engine() {
+    fn a_config_change_is_read_before_the_engine_stops() {
         let mut s = running();
         assert_eq!(s.on_event(Event::ConfigChanged), Some(CONFIG_QUIET));
-        assert_eq!(s, State::Starting);
+        assert_eq!(s, running(), "plays on until the new config is read");
+        assert_eq!(s.attempted(State::Starting), Some(CONFIG_QUIET));
+        assert_eq!(s.status(), "Starting");
     }
 }

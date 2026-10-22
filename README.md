@@ -49,6 +49,7 @@ Right-click the tray icon and check "Start with Windows".
 | Left speaker / Right speaker | Pick the speaker for each channel. The list refreshes when you plug one in |
 | Swap left / right            | Swaps the two speakers                                                     |
 | Test left / Test right       | Plays a short beep on that speaker                                         |
+| Timing                       | Moves the sound left or right by delaying one speaker, while it plays      |
 | Start with Windows           | Adds or removes the startup entry for the current user                     |
 | Open config file             | Opens `config.toml` for the advanced settings. Saving applies them         |
 | Open log folder              | One log file per run, newest last. Look here when something goes wrong     |
@@ -61,6 +62,8 @@ Right-click the tray icon and check "Start with Windows".
 **Crackling or dropouts**: The latency rises on its own after a dropout, so brief crackling right after starting is normal. If it keeps crackling, look at the log: it gets `audio dropouts` lines showing which speaker ran dry and how late the sound arrived, and `latency set` lines show the delay it settled on.
 
 **Left and right are swapped**: Choose "Swap left / right" in the tray menu.
+
+**The sound leans to one side**: The two speakers are kept in step by the time stamps Windows gives, which don't cover the speakers' own processing. Use "Timing" in the tray menu to move the sound back to the middle while music plays; it is saved as `right_delay_us` in `config.toml`.
 
 **Volume keys do nothing**: Make sure `volume_endpoint` in `config.toml` matches CABLE Input.
 

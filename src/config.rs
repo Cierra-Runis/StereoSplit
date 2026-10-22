@@ -40,6 +40,11 @@ pub struct Config {
     /// Which device's Windows volume to follow: VB-CABLE's playback side
     #[default("CABLE Input")]
     pub volume_endpoint: String,
+
+    /// How much later the right speaker plays than the left, in microseconds (negative: the
+    /// left plays later), on top of the automatic alignment. Raise it if the sound leans
+    /// right, lower it if it leans left. Up to ±20000. Changes apply while playing.
+    pub right_delay_us: i32,
 }
 
 impl Config {

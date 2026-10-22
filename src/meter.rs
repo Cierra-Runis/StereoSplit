@@ -129,7 +129,9 @@ impl Meter {
 
     /// Call at the start of every data callback, with the number of frames it passes at `rate`
     pub fn callback(&self, frames: usize, rate: u32) {
-        let now = saturate(self.epoch.elapsed().as_micros()) as u64;
+        // In u64: u32 µs runs out after 71.6 min, after which every gap read as 0, so Auto
+        // left out the speakers' block and they ran dry about once a minute (as logged)
+        let now = u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX - 1);
         if let Some(gap) = now.checked_sub(self.last_us.swap(now, Relaxed)) {
             self.gap_max_us.fetch_max(saturate(gap), Relaxed);
         }
@@ -364,6 +366,20 @@ mod tests {
         let s = m.take();
         assert_eq!((s.callbacks, s.dry), (0, 0));
         assert_eq!((s.delay_us, s.fill_min_us, s.drift_ppm), (None, None, None));
+    }
+
+    #[test]
+    fn gaps_still_count_after_hours() {
+        let mut m = Meter::new(StreamKind::Left);
+        // Instant can't go back past boot
+        let Some(epoch) = Instant::now().checked_sub(Duration::from_secs(80 * 60)) else {
+            return;
+        };
+        m.epoch = epoch;
+        m.callback(336, 48_000);
+        std::thread::sleep(Duration::from_millis(5));
+        m.callback(336, 48_000);
+        assert!(m.take().gap_max_us >= 5_000);
     }
 
     #[test]

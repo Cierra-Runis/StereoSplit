@@ -27,7 +27,7 @@ use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
     Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction,
 };
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -61,9 +61,17 @@ impl std::fmt::Display for StreamKind {
 /// stream that failed
 pub type OnError = Arc<dyn Fn(StreamKind) + Send + Sync>;
 
+/// The furthest apart the speakers can be set by hand, in µs
+pub const RIGHT_DELAY_MAX_US: i32 = 20_000;
+
+fn clamp_right_delay(us: i32) -> i32 {
+    us.clamp(-RIGHT_DELAY_MAX_US, RIGHT_DELAY_MAX_US)
+}
+
 pub struct Engine {
     input: Option<Stream>,
     outputs: Vec<Output>,
+    shared: Arc<Shared>,
     /// Logs how the streams are doing, until the engine is dropped
     _reporter: Reporter,
 }
@@ -416,14 +424,20 @@ struct Shared {
     target: AtomicUsize,
     /// Each speaker's own output latency (left, right), smoothed, in µs; 0 until it has played
     out_lat_us: [AtomicU32; 2],
+    /// How much later the right speaker plays than the left, in µs (negative: the left plays
+    /// later); set by hand, for what happens after Windows' time stamps (in the USB driver or
+    /// the speaker itself), which the delay measured here can't see
+    right_delay_us: AtomicI32,
     clock: CaptureClock,
 }
 
 impl Shared {
-    /// The delay both speakers keep, from capture until they play the sound, in s: the target
-    /// on top of the slower output, so that one keeps the target buffered and the other keeps
-    /// more, to play the sound at the same time. None until both speakers have played.
-    fn goal(&self, in_rate: u32) -> Option<f64> {
+    /// The delay the speaker in `slot` (0 = left, 1 = right) keeps, from capture until it plays
+    /// the sound, in s: the target on top of the slower output, so that one keeps the target
+    /// buffered and the other keeps more, to play the sound at the same time; plus
+    /// `right_delay_us` for the speaker meant to play later. None until both speakers have
+    /// played.
+    fn goal(&self, in_rate: u32, slot: usize) -> Option<f64> {
         let [l, r] = self
             .out_lat_us
             .each_ref()
@@ -432,7 +446,9 @@ impl Shared {
             return None;
         }
         let target = self.target.load(Ordering::Relaxed) as f64 / in_rate as f64;
-        Some(target + l.max(r) as f64 * 1e-6)
+        let right_delay = self.right_delay_us.load(Ordering::Relaxed) as f64 * 1e-6;
+        let own = if slot == 1 { right_delay } else { -right_delay }.max(0.0);
+        Some(target + l.max(r) as f64 * 1e-6 + own)
     }
 }
 
@@ -504,7 +520,7 @@ fn build_output(
             out_lat_avg = Some(avg);
             shared.out_lat_us[slot].store(((avg * 1e6) as u32).max(1), Ordering::Relaxed);
         }
-        let Some(goal) = shared.goal(in_rate) else {
+        let Some(goal) = shared.goal(in_rate, slot) else {
             data.fill(0.0);
             return;
         };
@@ -623,6 +639,7 @@ impl Engine {
         let shared = Arc::new(Shared {
             target: AtomicUsize::new(to_frames(latency::START_US)),
             out_lat_us: [AtomicU32::new(0), AtomicU32::new(0)],
+            right_delay_us: AtomicI32::new(clamp_right_delay(cfg.right_delay_us)),
             clock: CaptureClock::new(),
         });
         let cap = sample_rate as usize; // 1 second of capacity, enough to absorb any jitter
@@ -700,17 +717,28 @@ impl Engine {
 
         let chunk_us = (CHUNK_IN * 1_000_000 / sample_rate as usize) as u32;
         let mut control = AutoLatency::new(Instant::now(), chunk_us);
+        let auto_shared = shared.clone();
         let on_window = move |stats: &[Stats]| {
             if let Some(us) = control.update(Instant::now(), stats) {
-                shared.target.store(to_frames(us), Ordering::Relaxed);
+                auto_shared.target.store(to_frames(us), Ordering::Relaxed);
                 info!(latency_ms = us as f32 / 1000.0, "latency set");
             }
         };
         Ok(Engine {
             input: Some(input),
             outputs: vec![left, right],
+            shared,
             _reporter: Reporter::start(meters.into(), on_window),
         })
+    }
+
+    /// Have the right speaker play `us` µs later than the left (negative: the left later),
+    /// while playing. Each speaker moves there at [`DriftControl::RAMP`], so the sound glides
+    /// over without a gap.
+    pub fn set_right_delay(&self, us: i32) {
+        let us = clamp_right_delay(us);
+        self.shared.right_delay_us.store(us, Ordering::Relaxed);
+        info!(right_delay_ms = us as f32 / 1000.0, "right delay set");
     }
 }
 
@@ -736,6 +764,23 @@ mod tests {
             (out as f64 - expected).abs() < 200.0,
             "{out} samples out for {consumed} in, expected about {expected}"
         );
+    }
+
+    #[test]
+    fn right_delay_goes_on_the_later_speaker() {
+        let shared = Shared {
+            target: AtomicUsize::new(960),
+            out_lat_us: [AtomicU32::new(23_000), AtomicU32::new(30_000)],
+            right_delay_us: AtomicI32::new(0),
+            clock: CaptureClock::new(),
+        };
+        let goals_us = |us: i32| {
+            shared.right_delay_us.store(us, Ordering::Relaxed);
+            [0, 1].map(|slot| (shared.goal(48_000, slot).unwrap() * 1e6).round() as i32)
+        };
+        assert_eq!(goals_us(0), [50_000, 50_000]);
+        assert_eq!(goals_us(300), [50_000, 50_300]);
+        assert_eq!(goals_us(-1_000), [51_000, 50_000]);
     }
 
     /// With the speaker clock 200 ppm off, the delay still settles at the goal

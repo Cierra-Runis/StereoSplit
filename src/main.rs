@@ -86,6 +86,16 @@ fn menu_text(s: &str) -> String {
     s.replace('&', "&&")
 }
 
+/// Title of the timing submenu, e.g. "Timing: right 0.3 ms later"
+fn timing_text(right_delay_us: i32) -> String {
+    let ms = right_delay_us.unsigned_abs() as f32 / 1000.0;
+    match right_delay_us.signum() {
+        0 => "Timing: left and right together".into(),
+        1 => format!("Timing: right {ms} ms later"),
+        _ => format!("Timing: left {ms} ms later"),
+    }
+}
+
 /// Play the test tone on the speaker chosen for `side`
 fn test_tone(devices: &[String], side: usize) {
     let Ok(cfg) = config::load() else {
@@ -118,6 +128,10 @@ enum Action {
     /// Play the test tone on a side
     Test(usize),
     Swap,
+    /// Have the right speaker play this many µs later than it does now (negative: earlier)
+    RightDelay(i32),
+    /// Have both speakers play at the same time again
+    ResetRightDelay,
     Autostart,
     OpenConfig,
     OpenLog,
@@ -199,6 +213,21 @@ impl Tray {
             }
             menu
         });
+        let timing = Submenu::new(timing_text(cfg.right_delay_us), true);
+        // The earlier speaker is where the sound seems to come from, so delaying the right one
+        // moves it left
+        for (text, us) in [
+            ("Move sound left by 0.1 ms", 100),
+            ("Move sound left by 1 ms", 1000),
+            ("Move sound right by 0.1 ms", -100),
+            ("Move sound right by 1 ms", -1000),
+        ] {
+            let _ = timing.append(&a.item(text, true, Action::RightDelay(us)));
+        }
+        let _ = timing.append_items(&[
+            &PredefinedMenuItem::separator(),
+            &a.item("Reset", cfg.right_delay_us != 0, Action::ResetRightDelay),
+        ]);
         let separator = PredefinedMenuItem::separator;
         while self.menu.remove_at(0).is_some() {}
         let _ = self.menu.append_items(&[
@@ -209,6 +238,7 @@ impl Tray {
             &a.item("Swap left / right", true, Action::Swap),
             &a.item("Test left", chosen[0].is_some(), Action::Test(0)),
             &a.item("Test right", chosen[1].is_some(), Action::Test(1)),
+            &timing,
             &separator(),
             &a.check(
                 "Start with Windows",
@@ -239,6 +269,11 @@ impl Tray {
         match action {
             Action::Speaker(side, i) => edit_config(|c| choose(c, side, &devices[i], devices)),
             Action::Swap => edit_config(|c| std::mem::swap(&mut c.left, &mut c.right)),
+            Action::RightDelay(us) => edit_config(|c| {
+                let max = engine::RIGHT_DELAY_MAX_US;
+                c.right_delay_us = (c.right_delay_us + us).clamp(-max, max);
+            }),
+            Action::ResetRightDelay => edit_config(|c| c.right_delay_us = 0),
             Action::Test(side) => test_tone(devices, side),
             Action::Autostart => toggle_autostart(),
             Action::OpenConfig => open(&config::config_path()),
